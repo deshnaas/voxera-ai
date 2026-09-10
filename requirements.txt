@@ -1,0 +1,30 @@
+# Voxera — core runtime deps (Python 3.12).
+# Pinned to what is installed and verified on the demo machine (.venv312).
+
+# Speech-to-text
+openai-whisper==20250625
+
+# Priya / Kokoro text-to-speech
+kokoro==0.9.4
+misaki==0.9.4
+phonemizer==3.4.0
+phonemizer-fork==3.3.2
+espeakng-loader==0.2.4
+
+# ML runtime
+torch==2.13.0
+numpy==2.5.2
+scipy==1.18.1
+numba==0.67.0
+
+# Audio I/O + optional AEC barge-in
+sounddevice==0.5.6
+soundfile==0.14.0
+noisereduce==3.0.3
+pywebrtc-audio==0.2.0
+
+# LLM (Ollama HTTP) + database + misc
+requests==2.34.2
+ollama==0.6.2
+supabase==2.31.0
+python-dotenv==1.2.3
