@@ -92,3 +92,18 @@ only ever *read* clinician prescriptions for future call context, and only
 - Dashboard metrics on the Overview page are already Supabase‑derived; the new
   **Calls** page adds call‑analytics tiles (total, emergencies, completed, avg AI
   replies) from real `calls` rows.
+
+## Dashboard v2 (redesign, patient editing, prescriptions)
+
+Run **`sql/2026_dashboard_v2.sql`** once in the Supabase SQL Editor. It supersedes
+`sql/2026_voxera_dashboard_integration.sql` and `sql/2026_dashboard_read_policies.sql` and adds:
+
+- staff read access to calls, transcripts, summaries and events
+- `prescriptions` (clinician-only, `source = 'clinician'`) and `patient_medications`
+- clinical columns on `patients` (blood group, allergies, chronic conditions, emergency contact, notes)
+- staff permission to edit patients, resolve emergency cases and write audit events
+
+Dashboard pages: Command Center (prioritised "needs action now" queue), Emergency board,
+Patients (search + filters), Patient record (edit details, calls & transcripts, prescriptions,
+referrals, appointments), Calls + call detail, Referral triage queue.
+Voxera OTC guidance, patient-reported medicines and clinician prescriptions are always shown separately.

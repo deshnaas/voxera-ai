@@ -680,7 +680,8 @@ export default function ReferralDetailsPage() {
               </p>
             </div>
 
-            <div className="flex flex-wrap gap-3">
+            <div className="flex flex-wrap items-center gap-3">
+              <Link href={`/dashboard/patients/${patient.id}`} className="btn">Patient record &amp; Voxera conversation</Link>
               <span
                 className={`rounded-full border-2 px-4 py-2 text-sm font-bold uppercase ${statusClass(
                   referral.status

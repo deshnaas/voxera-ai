@@ -1,315 +1,128 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import Link from "next/link";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { supabase } from "@/lib/supabase";
+import { useStaff } from "@/lib/staff";
+import type { Patient } from "@/lib/voxera";
+import { ageFromDob, timeAgo } from "@/lib/format";
+import { Avatar, Badge, Callout, Chip, EmptyState, LoadingRows, Page, PageHeader } from "../components/ui";
+import Icon from "../components/Icon";
 
-type Patient = {
-  id: string;
-  full_name: string;
-  phone: string | null;
-  date_of_birth: string | null;
-  gender: string | null;
-  preferred_language: string | null;
-  village_or_locality: string | null;
-  district: string | null;
-};
+type Filter = "all" | "emergency" | "referral" | "calls";
 
 export default function PatientsPage() {
+  const { facilityId, tick } = useStaff();
   const [patients, setPatients] = useState<Patient[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [message, setMessage] = useState("");
+  const [emergencyIds, setEmergencyIds] = useState<Set<string>>(new Set());
+  const [referralIds, setReferralIds] = useState<Set<string>>(new Set());
+  const [lastCall, setLastCall] = useState<Record<string, string>>({});
+  const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState("");
+  const [q, setQ] = useState("");
+  const [filter, setFilter] = useState<Filter>("all");
 
-  useEffect(() => {
-    async function loadPatients() {
-      setLoading(true);
-      setMessage("");
+  const load = useCallback(async () => {
+    if (!facilityId) return;
+    const [pt, em, rf, cl] = await Promise.all([
+      supabase.from("patients").select("*").order("created_at", { ascending: false }).limit(1000),
+      supabase.from("emergency_cases").select("patient_id").eq("facility_id", facilityId).eq("status", "active"),
+      supabase.from("referrals").select("patient_id").eq("receiving_facility_id", facilityId).neq("status", "rejected"),
+      supabase.from("calls").select("patient_id, created_at").order("created_at", { ascending: false }).limit(2000),
+    ]);
+    if (pt.error) { setError("Unable to load patients: " + pt.error.message); setLoaded(true); return; }
+    setError("");
+    setPatients((pt.data ?? []) as Patient[]);
+    setEmergencyIds(new Set((em.data ?? []).map((r) => r.patient_id as string)));
+    setReferralIds(new Set((rf.data ?? []).map((r) => r.patient_id as string)));
+    const last: Record<string, string> = {};
+    (cl.data ?? []).forEach((c) => {
+      const pid = c.patient_id as string | null;
+      if (pid && !last[pid]) last[pid] = c.created_at as string;
+    });
+    setLastCall(last);
+    setLoaded(true);
+  }, [facilityId]);
 
-      // --------------------------------------------------
-      // 1. Get logged-in hospital user
-      // --------------------------------------------------
+  useEffect(() => { void load(); }, [load, tick]);
 
-      const {
-        data: { user },
-        error: userError,
-      } = await supabase.auth.getUser();
+  const rows = useMemo(() => {
+    const term = q.trim().toLowerCase();
+    return patients
+      .filter((p) => {
+        if (filter === "emergency" && !emergencyIds.has(p.id)) return false;
+        if (filter === "referral" && !referralIds.has(p.id)) return false;
+        if (filter === "calls" && !lastCall[p.id]) return false;
+        if (!term) return true;
+        return (p.full_name ?? "").toLowerCase().includes(term) || (p.phone ?? "").includes(term)
+          || (p.village_or_locality ?? "").toLowerCase().includes(term);
+      })
+      .sort((a, b) => {
+        const ea = emergencyIds.has(a.id) ? 1 : 0, eb = emergencyIds.has(b.id) ? 1 : 0;
+        if (ea !== eb) return eb - ea;
+        const la = lastCall[a.id] ?? a.created_at ?? "", lb = lastCall[b.id] ?? b.created_at ?? "";
+        return lb.localeCompare(la);
+      });
+  }, [patients, q, filter, emergencyIds, referralIds, lastCall]);
 
-      if (userError || !user) {
-        setMessage("You are not logged in.");
-        setLoading(false);
-        return;
-      }
+  return (
+    <Page>
+      <PageHeader
+        eyebrow="Records"
+        title="Patients"
+        subtitle="Everyone who has spoken with Voxera or been referred to this hospital. Active emergencies are pinned to the top."
+      />
 
-      // --------------------------------------------------
-      // 2. Find the hospital assigned to this user
-      // --------------------------------------------------
-
-      const { data: hospitalUser, error: hospitalUserError } =
-        await supabase
-          .from("hospital_users")
-          .select("facility_id")
-          .eq("user_id", user.id)
-          .single();
-
-      if (hospitalUserError || !hospitalUser) {
-        setMessage("Hospital information could not be found.");
-        setLoading(false);
-        return;
-      }
-
-      const facilityId = hospitalUser.facility_id;
-
-      // --------------------------------------------------
-      // 3. Find patients connected to active referrals
-      //    received by this hospital.
-      //
-      // Rejected referrals are excluded.
-      // --------------------------------------------------
-
-      const { data: referralsData, error: referralsError } =
-        await supabase
-          .from("referrals")
-          .select("patient_id")
-          .eq("receiving_facility_id", facilityId)
-          .neq("status", "rejected");
-
-      if (referralsError) {
-        setMessage("Patient referrals could not be loaded.");
-        setLoading(false);
-        return;
-      }
-
-      const patientIds = [
-        ...new Set(
-          (referralsData ?? []).map(
-            (referral) => referral.patient_id
-          )
-        ),
-      ];
-
-      if (patientIds.length === 0) {
-        setPatients([]);
-        setLoading(false);
-        return;
-      }
-
-      // --------------------------------------------------
-      // 4. Load patient information
-      // --------------------------------------------------
-
-      const { data: patientsData, error: patientsError } =
-        await supabase
-          .from("patients")
-          .select(
-            `
-              id,
-              full_name,
-              phone,
-              date_of_birth,
-              gender,
-              preferred_language,
-              village_or_locality,
-              district
-            `
-          )
-          .in("id", patientIds)
-          .order("full_name", {
-            ascending: true,
-          });
-
-      if (patientsError) {
-        setMessage("Patient information could not be loaded.");
-        setLoading(false);
-        return;
-      }
-
-      setPatients((patientsData ?? []) as Patient[]);
-      setLoading(false);
-    }
-
-    loadPatients();
-  }, []);
-
-  // --------------------------------------------------
-  // Loading
-  // --------------------------------------------------
-
-  if (loading) {
-    return (
-      <main className="dashboard-page flex min-h-screen items-center justify-center p-8">
-        <p className="text-lg font-semibold">
-          Loading patients...
-        </p>
-      </main>
-    );
-  }
-
-  // --------------------------------------------------
-  // Error
-  // --------------------------------------------------
-
-  if (message) {
-    return (
-      <main className="dashboard-page flex min-h-screen items-center justify-center p-8">
-        <div className="dashboard-panel rounded-2xl border-2 border-[#D4AF37] p-8">
-          <h1 className="text-2xl font-bold">
-            VOXERA
-          </h1>
-
-          <p className="mt-4">
-            {message}
-          </p>
+      <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <div className="relative w-full md:max-w-sm">
+          <span className="text-faint pointer-events-none absolute left-3 top-1/2 -translate-y-1/2"><Icon name="search" size={16} /></span>
+          <input className="input" style={{ paddingLeft: 36 }} placeholder="Filter by name, phone or locality" value={q} onChange={(e) => setQ(e.target.value)} />
         </div>
-      </main>
-    );
-  }
-
-  // --------------------------------------------------
-  // Patients page
-  // --------------------------------------------------
-
-  return (
-    <main className="dashboard-page min-h-screen p-4 sm:p-8">
-      <div className="mx-auto max-w-7xl">
-
-        {/* Header */}
-        <section className="dashboard-panel dashboard-hover-glow rounded-2xl border-2 border-[#D4AF37] p-8">
-          <p className="dashboard-muted text-sm font-semibold uppercase tracking-widest">
-            Patient Management
-          </p>
-
-          <div className="mt-2 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
-            <div>
-              <h1 className="text-4xl font-bold">
-                Patients
-              </h1>
-
-              <p className="dashboard-muted mt-2">
-                Patients with active referrals at this hospital.
-              </p>
-            </div>
-
-            <div className="rounded-full border-2 border-[#D4AF37] px-4 py-2 text-sm font-bold">
-              {patients.length}{" "}
-              {patients.length === 1
-                ? "Patient"
-                : "Patients"}
-            </div>
-          </div>
-        </section>
-
-        {/* Empty State */}
-        {patients.length === 0 ? (
-          <section className="dashboard-panel mt-8 rounded-2xl border-2 border-[#D4AF37] p-10 text-center">
-            <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full border-2 border-[#D4AF37] text-2xl">
-              ♙
-            </div>
-
-            <h2 className="mt-5 text-2xl font-bold">
-              No Patients Yet
-            </h2>
-
-            <p className="dashboard-muted mx-auto mt-2 max-w-lg">
-              Patients will appear here when Voxera AI
-              sends an active referral to this hospital.
-            </p>
-          </section>
-        ) : (
-          /* Patient List */
-          <section className="mt-8 grid gap-5 md:grid-cols-2">
-            {patients.map((patient) => (
-              <article
-                key={patient.id}
-                className="dashboard-panel dashboard-hover-glow rounded-2xl border-2 border-[#D4AF37] p-6"
-              >
-                <div className="flex items-start justify-between gap-4">
-                  <div>
-                    <p className="dashboard-muted text-xs font-semibold uppercase tracking-wider">
-                      Patient
-                    </p>
-
-                    <h2 className="mt-2 text-2xl font-bold">
-                      {patient.full_name}
-                    </h2>
-                  </div>
-
-                  <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border-2 border-[#D4AF37]">
-                    ♙
-                  </span>
-                </div>
-
-                <div className="mt-6 grid gap-4 sm:grid-cols-2">
-                  <PatientInfo
-                    label="Phone"
-                    value={
-                      patient.phone ??
-                      "Not available"
-                    }
-                  />
-
-                  <PatientInfo
-                    label="Gender"
-                    value={
-                      patient.gender ??
-                      "Not available"
-                    }
-                  />
-
-                  <PatientInfo
-                    label="Language"
-                    value={
-                      patient.preferred_language ??
-                      "Not available"
-                    }
-                  />
-
-                  <PatientInfo
-                    label="District"
-                    value={
-                      patient.district ??
-                      "Not available"
-                    }
-                  />
-                </div>
-
-                {/* View Patient Details */}
-                <div className="mt-6 border-t border-gray-300 pt-5">
-                  <Link
-                    href={`/dashboard/patients/${patient.id}`}
-                    className="dashboard-hover-glow inline-flex w-full items-center justify-center rounded-lg border-2 border-[#D4AF37] px-5 py-3 text-sm font-bold transition-all hover:bg-[#D4AF37] hover:text-black"
-                  >
-                    View Patient Details
-                  </Link>
-                </div>
-              </article>
-            ))}
-          </section>
-        )}
+        <div className="flex flex-wrap gap-2">
+          <Chip active={filter === "all"} onClick={() => setFilter("all")}>All ({patients.length})</Chip>
+          <Chip active={filter === "emergency"} onClick={() => setFilter("emergency")}>Active emergency ({emergencyIds.size})</Chip>
+          <Chip active={filter === "referral"} onClick={() => setFilter("referral")}>Referred here</Chip>
+          <Chip active={filter === "calls"} onClick={() => setFilter("calls")}>Has Voxera calls</Chip>
+        </div>
       </div>
-    </main>
-  );
-}
 
-// --------------------------------------------------
-// Reusable patient information item
-// --------------------------------------------------
+      {error && <Callout tone="critical" className="mb-4">{error}</Callout>}
 
-function PatientInfo({
-  label,
-  value,
-}: {
-  label: string;
-  value: string;
-}) {
-  return (
-    <div>
-      <p className="dashboard-muted text-xs font-semibold uppercase tracking-wider">
-        {label}
-      </p>
-
-      <p className="mt-1 font-medium">
-        {value}
-      </p>
-    </div>
+      {!loaded ? <LoadingRows rows={5} /> : rows.length === 0 ? (
+        <div className="card"><EmptyState icon="♙" title="No patients match" hint={q ? "Try a different name or phone number." : "Patients appear here after their first Voxera call."} /></div>
+      ) : (
+        <div className="card overflow-x-auto">
+          <table className="table">
+            <thead><tr><th>Patient</th><th>Age / gender</th><th>Phone</th><th>Locality</th><th>Last contact</th><th>Flags</th></tr></thead>
+            <tbody>
+              {rows.map((p) => {
+                const emergency = emergencyIds.has(p.id);
+                const age = ageFromDob(p.date_of_birth);
+                return (
+                  <tr key={p.id} className={emergency ? "triage triage-critical" : undefined}>
+                    <td>
+                      <Link href={`/dashboard/patients/${p.id}`} className="flex items-center gap-3 font-semibold hover:underline">
+                        <Avatar name={p.full_name} size={34} tone={emergency ? "critical" : undefined} /> {p.full_name}
+                      </Link>
+                    </td>
+                    <td>{[age !== null && `${age}`, p.gender].filter(Boolean).join(" · ") || "—"}</td>
+                    <td>{p.phone ?? "—"}</td>
+                    <td className="text-muted">{[p.village_or_locality, p.district].filter(Boolean).join(", ") || "—"}</td>
+                    <td className="text-muted whitespace-nowrap">{lastCall[p.id] ? timeAgo(lastCall[p.id]) : "—"}</td>
+                    <td>
+                      <div className="flex flex-wrap gap-1.5">
+                        {emergency && <Badge tone="critical">Emergency</Badge>}
+                        {referralIds.has(p.id) && <Badge tone="warning">Referred</Badge>}
+                        {p.allergies && <Badge tone="warning">Allergy</Badge>}
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Page>
   );
 }

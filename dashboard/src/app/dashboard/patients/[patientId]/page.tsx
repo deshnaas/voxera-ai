@@ -1,638 +1,272 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
+import { useCallback, useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
+import { useStaff } from "@/lib/staff";
+import {
+  getCallsForPatient, getPrescriptions, getReportedProfile,
+  type Patient, type Prescription, type VoxeraCall,
+} from "@/lib/voxera";
+import { ageFromDob, fmtDate, fmtDateTime, fmtTime, statusBadge, urgencyBadge } from "@/lib/format";
+import { Avatar, Badge, Callout, EmptyState, InfoItem, LoadingRows, Page, SectionCard, Tabs } from "../../components/ui";
 import CallHistory from "../../components/CallHistory";
-
-type Patient = {
-  id: string;
-  full_name: string;
-  phone: string | null;
-  date_of_birth: string | null;
-  gender: string | null;
-  preferred_language: string | null;
-  village_or_locality: string | null;
-  district: string | null;
-};
+import PrescriptionsPanel from "../../components/PrescriptionsPanel";
+import EditPatientModal from "../../components/EditPatientModal";
+import Icon from "../../components/Icon";
 
 type Referral = {
-  id: string;
-  reason: string;
-  urgency: string;
-  status: string;
-  required_service: string | null;
-  ai_summary: string | null;
-  ai_recommendation: string | null;
-  recommended_department: string | null;
-  created_at: string;
+  id: string; reason: string; urgency: string; status: string; required_service: string | null;
+  ai_summary: string | null; ai_recommendation: string | null; recommended_department: string | null; created_at: string;
 };
-
 type Appointment = {
-  id: string;
-  appointment_date: string;
-  appointment_time: string | null;
-  department: string | null;
-  doctor_name: string | null;
-  reason: string | null;
-  status: string;
+  id: string; appointment_date: string; appointment_time: string | null; department: string | null;
+  doctor_name: string | null; reason: string | null; status: string;
 };
+type Reported = Awaited<ReturnType<typeof getReportedProfile>>;
+type Tab = "overview" | "calls" | "rx" | "referrals" | "appointments";
 
-export default function PatientDetailsPage() {
-  const params = useParams();
-  const patientId = params.patientId as string;
+const splitList = (s: string | null | undefined) =>
+  (s ?? "").split(/[,;\n]/).map((x) => x.trim()).filter(Boolean);
+
+export default function PatientPage() {
+  const { patientId } = useParams<{ patientId: string }>();
+  const { facilityId, tick } = useStaff();
 
   const [patient, setPatient] = useState<Patient | null>(null);
   const [referrals, setReferrals] = useState<Referral[]>([]);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
+  const [calls, setCalls] = useState<VoxeraCall[]>([]);
+  const [rx, setRx] = useState<{ rows: Prescription[]; tableMissing: boolean }>({ rows: [], tableMissing: false });
+  const [reported, setReported] = useState<Reported | null>(null);
+  const [activeEmergency, setActiveEmergency] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [tab, setTab] = useState<Tab>("overview");
+  const [editing, setEditing] = useState(false);
 
-  useEffect(() => {
-    async function loadPatientDetails() {
-      setLoading(true);
-      setMessage("");
+  const load = useCallback(async () => {
+    if (!facilityId || !patientId) return;
+    const { data: p, error: pErr } = await supabase.from("patients").select("*").eq("id", patientId).maybeSingle();
+    if (pErr || !p) { setError(pErr?.message ?? "Patient could not be found."); setLoading(false); return; }
+    setError("");
+    setPatient(p as Patient);
 
-      // --------------------------------------------------
-      // 1. Get logged-in hospital user
-      // --------------------------------------------------
+    const [rf, ap, cl, rxr, em] = await Promise.all([
+      supabase.from("referrals")
+        .select("id, reason, urgency, status, required_service, ai_summary, ai_recommendation, recommended_department, created_at")
+        .eq("patient_id", patientId).eq("receiving_facility_id", facilityId).order("created_at", { ascending: false }),
+      supabase.from("appointments")
+        .select("id, appointment_date, appointment_time, department, doctor_name, reason, status")
+        .eq("patient_id", patientId).eq("facility_id", facilityId).order("appointment_date", { ascending: false }),
+      getCallsForPatient(patientId),
+      getPrescriptions(patientId),
+      supabase.from("emergency_cases").select("id", { count: "exact", head: true })
+        .eq("patient_id", patientId).eq("facility_id", facilityId).eq("status", "active"),
+    ]);
+    setReferrals((rf.data ?? []) as Referral[]);
+    setAppointments((ap.data ?? []) as Appointment[]);
+    setCalls(cl);
+    setRx(rxr);
+    setActiveEmergency((em.count ?? 0) > 0);
+    setLoading(false);
+    setReported(await getReportedProfile(cl.map((c) => c.id)));
+  }, [facilityId, patientId]);
 
-      const {
-        data: { user },
-        error: userError,
-      } = await supabase.auth.getUser();
+  useEffect(() => { void load(); }, [load, tick]);
 
-      if (userError || !user) {
-        setMessage("You are not logged in.");
-        setLoading(false);
-        return;
-      }
-
-      // --------------------------------------------------
-      // 2. Find hospital assigned to this user
-      // --------------------------------------------------
-
-      const { data: hospitalUser, error: hospitalUserError } =
-        await supabase
-          .from("hospital_users")
-          .select("facility_id")
-          .eq("user_id", user.id)
-          .single();
-
-      if (hospitalUserError || !hospitalUser) {
-        setMessage("Hospital information could not be found.");
-        setLoading(false);
-        return;
-      }
-
-      const facilityId = hospitalUser.facility_id;
-
-      // --------------------------------------------------
-      // 3. Load the selected patient
-      // --------------------------------------------------
-
-      const { data: patientData, error: patientError } =
-        await supabase
-          .from("patients")
-          .select(
-            `
-              id,
-              full_name,
-              phone,
-              date_of_birth,
-              gender,
-              preferred_language,
-              village_or_locality,
-              district
-            `
-          )
-          .eq("id", patientId)
-          .single();
-
-      if (patientError || !patientData) {
-        setMessage("Patient could not be found.");
-        setLoading(false);
-        return;
-      }
-
-      // --------------------------------------------------
-      // 4. Verify this patient actually belongs to this
-      //    hospital through a received referral.
-      // --------------------------------------------------
-
-      const { data: referralData, error: referralError } =
-        await supabase
-          .from("referrals")
-          .select(
-            `
-              id,
-              reason,
-              urgency,
-              status,
-              required_service,
-              ai_summary,
-              ai_recommendation,
-              recommended_department,
-              created_at
-            `
-          )
-          .eq("patient_id", patientId)
-          .eq("receiving_facility_id", facilityId)
-          .order("created_at", {
-            ascending: false,
-          });
-
-      if (referralError) {
-        setMessage("Patient referral history could not be loaded.");
-        setLoading(false);
-        return;
-      }
-
-      const patientReferrals =
-        (referralData ?? []) as Referral[];
-
-      // --------------------------------------------------
-      // 5. Load appointments for this patient at this
-      //    hospital.
-      // --------------------------------------------------
-
-      const { data: appointmentData, error: appointmentError } =
-        await supabase
-          .from("appointments")
-          .select(
-            `
-              id,
-              appointment_date,
-              appointment_time,
-              department,
-              doctor_name,
-              reason,
-              status
-            `
-          )
-          .eq("patient_id", patientId)
-          .eq("facility_id", facilityId)
-          .order("appointment_date", {
-            ascending: false,
-          });
-
-      if (appointmentError) {
-        setMessage("Patient appointments could not be loaded.");
-        setLoading(false);
-        return;
-      }
-
-      setPatient(patientData as Patient);
-      setReferrals(patientReferrals);
-      setAppointments(
-        (appointmentData ?? []) as Appointment[]
-      );
-
-      setLoading(false);
-    }
-
-    if (patientId) {
-      loadPatientDetails();
-    }
-  }, [patientId]);
-
-  // --------------------------------------------------
-  // Loading state
-  // --------------------------------------------------
-
-  if (loading) {
+  if (loading) return <Page><LoadingRows rows={4} /></Page>;
+  if (error || !patient) {
     return (
-      <main className="dashboard-page flex min-h-screen items-center justify-center p-8">
-        <p className="text-lg font-semibold">
-          Loading patient details...
-        </p>
-      </main>
+      <Page>
+        <Callout tone="critical">{error || "Patient could not be found."}</Callout>
+        <Link href="/dashboard/patients" className="btn mt-4">← Back to patients</Link>
+      </Page>
     );
   }
 
-  // --------------------------------------------------
-  // Error state
-  // --------------------------------------------------
-
-  if (message || !patient) {
-    return (
-      <main className="dashboard-page flex min-h-screen items-center justify-center p-8">
-        <div className="dashboard-panel rounded-2xl border-2 border-[#D4AF37] p-8">
-          <h1 className="text-2xl font-bold">
-            VOXERA
-          </h1>
-
-          <p className="mt-4">
-            {message || "Patient could not be found."}
-          </p>
-
-          <Link
-            href="/dashboard/patients"
-            className="mt-6 inline-flex rounded-lg border-2 border-[#D4AF37] px-5 py-3 text-sm font-bold transition-all hover:bg-[#D4AF37] hover:text-black"
-          >
-            Back to Patients
-          </Link>
-        </div>
-      </main>
-    );
-  }
-
-  // --------------------------------------------------
-  // Helpers
-  // --------------------------------------------------
-
-  function formatDate(date: string | null) {
-    if (!date) {
-      return "Not available";
-    }
-
-    return new Intl.DateTimeFormat("en-IN", {
-      day: "2-digit",
-      month: "short",
-      year: "numeric",
-    }).format(new Date(date));
-  }
-
-  function formatTime(time: string | null) {
-    if (!time) {
-      return "Not specified";
-    }
-
-    return time.slice(0, 5);
-  }
-
-  function getStatusClass(status: string) {
-    const normalized = status.toLowerCase();
-
-    if (normalized === "accepted") {
-      return "border-green-500 text-green-600";
-    }
-
-    if (
-      normalized === "rejected" ||
-      normalized === "missed" ||
-      normalized === "cancelled"
-    ) {
-      return "border-red-500 text-red-600";
-    }
-
-    if (
-      normalized === "completed"
-    ) {
-      return "border-blue-500 text-blue-600";
-    }
-
-    return "border-[#D4AF37] text-[#9a7b13]";
-  }
-
-  // --------------------------------------------------
-  // Page
-  // --------------------------------------------------
+  const age = ageFromDob(patient.date_of_birth) ?? reported?.age ?? null;
+  const clinicalKnown = "allergies" in patient;
+  const allergyList = [...new Set([...splitList(patient.allergies), ...(reported?.allergies ?? [])])];
+  const conditionList = [...new Set([...splitList(patient.chronic_conditions), ...(reported?.conditions ?? [])])];
+  const activeRx = rx.rows.filter((r) => r.status === "active");
 
   return (
-    <main className="dashboard-page min-h-screen p-4 sm:p-8">
-      <div className="mx-auto max-w-7xl">
+    <Page>
+      <Link href="/dashboard/patients" className="text-muted inline-flex items-center gap-1 text-sm font-semibold hover:underline">← Patients</Link>
 
-        {/* Back */}
-        <Link
-          href="/dashboard/patients"
-          className="dashboard-muted inline-flex items-center gap-2 text-sm font-semibold transition-colors hover:text-[#9a7b13]"
-        >
-          ← Back to Patients
-        </Link>
-
-        {/* Patient Header */}
-        <section className="dashboard-panel dashboard-hover-glow mt-5 rounded-2xl border-2 border-[#D4AF37] p-8">
-          <div className="flex flex-col gap-6 sm:flex-row sm:items-center sm:justify-between">
-            <div className="flex items-center gap-5">
-              <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-full border-2 border-[#D4AF37] text-2xl">
-                ♙
-              </div>
-
-              <div>
-                <p className="dashboard-muted text-sm font-semibold uppercase tracking-widest">
-                  Patient Profile
-                </p>
-
-                <h1 className="mt-1 text-4xl font-bold">
-                  {patient.full_name}
-                </h1>
-
-                <p className="dashboard-muted mt-2 text-sm">
-                  Patient ID: {patient.id}
-                </p>
-              </div>
-            </div>
-
-            <div className="rounded-full border-2 border-[#D4AF37] px-4 py-2 text-sm font-bold">
-              {referrals.length}{" "}
-              {referrals.length === 1
-                ? "Referral"
-                : "Referrals"}
-            </div>
-          </div>
-        </section>
-
-        {/* Patient Information */}
-        <section className="dashboard-panel mt-6 rounded-2xl border-2 border-[#D4AF37] p-8">
-          <p className="dashboard-muted text-sm font-semibold uppercase tracking-widest">
-            Personal Information
-          </p>
-
-          <h2 className="mt-2 text-2xl font-bold">
-            Patient Details
-          </h2>
-
-          <div className="mt-6 grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
-            <InfoItem
-              label="Full Name"
-              value={patient.full_name}
-            />
-
-            <InfoItem
-              label="Phone"
-              value={patient.phone ?? "Not available"}
-            />
-
-            <InfoItem
-              label="Date of Birth"
-              value={formatDate(patient.date_of_birth)}
-            />
-
-            <InfoItem
-              label="Gender"
-              value={patient.gender ?? "Not available"}
-            />
-
-            <InfoItem
-              label="Preferred Language"
-              value={
-                patient.preferred_language ??
-                "Not available"
-              }
-            />
-
-            <InfoItem
-              label="Locality"
-              value={
-                patient.village_or_locality ??
-                "Not available"
-              }
-            />
-
-            <InfoItem
-              label="District"
-              value={
-                patient.district ??
-                "Not available"
-              }
-            />
-          </div>
-        </section>
-
-        {/* Referral History */}
-        <section className="dashboard-panel mt-6 rounded-2xl border-2 border-[#D4AF37] p-8">
-          <div>
-            <p className="dashboard-muted text-sm font-semibold uppercase tracking-widest">
-              Referral History
-            </p>
-
-            <h2 className="mt-2 text-2xl font-bold">
-              Patient Referrals
-            </h2>
-          </div>
-
-          {referrals.length === 0 ? (
-            <div className="dashboard-subtle mt-6 rounded-xl border border-gray-300 p-6 text-center">
-              <p className="font-semibold">
-                No referrals found
+      {/* Header ---------------------------------------------------- */}
+      <section className={`card mt-3 p-5 ${activeEmergency ? "triage triage-critical" : ""}`}>
+        <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+          <div className="flex min-w-0 items-center gap-4">
+            <Avatar name={patient.full_name} size={64} tone={activeEmergency ? "critical" : undefined} />
+            <div className="min-w-0">
+              <p className="eyebrow">Patient record</p>
+              <h1 className="truncate text-2xl font-extrabold sm:text-3xl">{patient.full_name}</h1>
+              <p className="text-muted mt-1 text-sm">
+                {[age !== null && `${age} yrs`, patient.gender, patient.blood_group && `Blood ${patient.blood_group}`, patient.village_or_locality, patient.district].filter(Boolean).join(" · ") || "No demographic details yet"}
               </p>
             </div>
-          ) : (
-            <div className="mt-6 space-y-5">
-              {referrals.map((referral) => (
-                <article
-                  key={referral.id}
-                  className="rounded-xl border border-gray-300 p-5"
-                >
-                  <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-                    <div>
-                      <div className="flex flex-wrap items-center gap-3">
-                        <span
-                          className={`rounded-full border-2 px-3 py-1 text-xs font-bold uppercase ${getStatusClass(
-                            referral.status
-                          )}`}
-                        >
-                          {referral.status}
-                        </span>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {patient.phone && <a className="btn btn-lg" href={`tel:${patient.phone}`}><Icon name="phone" size={16} /> {patient.phone}</a>}
+            <button className="btn btn-lg" onClick={() => setEditing(true)}><Icon name="edit" size={16} /> Edit details</button>
+            <button className="btn btn-primary btn-lg" onClick={() => setTab("rx")}><Icon name="pill" size={16} /> Prescribe</button>
+          </div>
+        </div>
 
-                        <span
-                          className={`rounded-full border-2 px-3 py-1 text-xs font-bold uppercase ${
-                            referral.urgency.toLowerCase() ===
-                              "high" ||
-                            referral.urgency.toLowerCase() ===
-                              "emergency"
-                              ? "border-red-500 text-red-600"
-                              : "border-[#D4AF37] text-[#9a7b13]"
-                          }`}
-                        >
-                          {referral.urgency}
-                        </span>
-                      </div>
+        {(activeEmergency || allergyList.length > 0 || reported?.pregnant) && (
+          <div className="mt-4 space-y-2">
+            {activeEmergency && <Callout tone="critical"><b>Active emergency</b> for this patient. <Link href="/dashboard/emergency" className="font-bold underline">Open emergency board</Link></Callout>}
+            {allergyList.length > 0 && <Callout tone="warning"><b>Allergies:</b> {allergyList.join(", ")}</Callout>}
+            {reported?.pregnant && <Callout tone="warning"><b>Patient reported being pregnant</b> (told Voxera, unverified)</Callout>}
+          </div>
+        )}
+      </section>
 
-                      <p className="dashboard-muted mt-4 text-xs font-semibold uppercase tracking-wider">
-                        Reason
-                      </p>
+      <div className="mt-5">
+        <Tabs<Tab> value={tab} onChange={setTab} tabs={[
+          { id: "overview", label: "Overview" },
+          { id: "calls", label: `Calls & conversations (${calls.length})` },
+          { id: "rx", label: `Prescriptions (${activeRx.length})` },
+          { id: "referrals", label: `Referrals (${referrals.length})` },
+          { id: "appointments", label: `Appointments (${appointments.length})` },
+        ]} />
+      </div>
 
-                      <p className="mt-1 font-medium">
-                        {referral.reason}
-                      </p>
-                    </div>
+      <div className="mt-5">
+        {tab === "overview" && (
+          <div className="grid gap-5 lg:grid-cols-3">
+            <div className="space-y-5 lg:col-span-2">
+              <SectionCard title="Patient details" actions={<button className="btn btn-sm" onClick={() => setEditing(true)}><Icon name="edit" size={14} /> Edit</button>}>
+                <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
+                  <InfoItem label="Full name" value={patient.full_name} />
+                  <InfoItem label="Phone" value={patient.phone} />
+                  <InfoItem label="Date of birth" value={patient.date_of_birth ? `${fmtDate(patient.date_of_birth)}${age !== null ? ` (${age})` : ""}` : "—"} />
+                  <InfoItem label="Gender" value={patient.gender} />
+                  <InfoItem label="Language" value={patient.preferred_language} />
+                  <InfoItem label="Locality" value={patient.village_or_locality} />
+                  <InfoItem label="District" value={patient.district} />
+                  {clinicalKnown && <>
+                    <InfoItem label="Blood group" value={patient.blood_group} />
+                    <InfoItem label="Emergency contact" value={patient.emergency_contact_name ? `${patient.emergency_contact_name}${patient.emergency_contact_phone ? ` · ${patient.emergency_contact_phone}` : ""}` : "—"} />
+                    <InfoItem label="Allergies (verified)" value={patient.allergies} />
+                    <InfoItem label="Chronic conditions (verified)" value={patient.chronic_conditions} />
+                    <InfoItem label="Clinical notes" value={patient.clinical_notes} />
+                  </>}
+                </div>
+                {!clinicalKnown && (
+                  <Callout tone="info" className="mt-4">Clinical fields (allergies, blood group, emergency contact) need <code>sql/2026_dashboard_v2.sql</code> to be run once.</Callout>
+                )}
+              </SectionCard>
 
-                    <div className="dashboard-muted text-sm">
-                      {formatDate(referral.created_at)}
-                    </div>
+              <SectionCard title="Latest Voxera call" subtitle="Most recent conversation and structured summary">
+                {calls.length === 0 ? <p className="text-muted text-sm">No Voxera calls yet.</p> : (
+                  <div>
+                    <p className="text-sm">{reported?.latest?.chief_concern ?? "Summary not available for the latest call."}</p>
+                    <button className="btn btn-sm mt-3" onClick={() => setTab("calls")}>View conversation</button>
                   </div>
+                )}
+              </SectionCard>
+            </div>
 
-                  <div className="mt-5 grid gap-5 border-t border-gray-300 pt-5 sm:grid-cols-2">
-                    <InfoItem
-                      label="Required Service"
-                      value={
-                        referral.required_service ??
-                        "Not specified"
-                      }
-                    />
-
-                    <InfoItem
-                      label="Recommended Department"
-                      value={
-                        referral.recommended_department ??
-                        "Not specified"
-                      }
-                    />
+            <div className="space-y-5">
+              <SectionCard title="Told Voxera" subtitle="Patient-reported across all calls — unverified">
+                {!reported ? <LoadingRows rows={1} /> : (
+                  <div className="space-y-3 text-sm">
+                    <ListRow label="Allergies" items={reported.allergies} />
+                    <ListRow label="Conditions" items={reported.conditions} />
+                    <ListRow label="Medicines mentioned" items={reported.medications} />
                   </div>
+                )}
+              </SectionCard>
+              <SectionCard title="Active prescriptions" actions={<button className="btn btn-sm" onClick={() => setTab("rx")}>Manage</button>}>
+                {activeRx.length === 0 ? <p className="text-muted text-sm">None.</p> : (
+                  <ul className="space-y-2 text-sm">
+                    {activeRx.slice(0, 5).map((p) => (
+                      <li key={p.id}><b>{p.medication_name}</b> <span className="text-muted">{[p.dosage, p.frequency].filter(Boolean).join(" · ")}</span></li>
+                    ))}
+                  </ul>
+                )}
+              </SectionCard>
+            </div>
+          </div>
+        )}
 
-                  {referral.ai_summary && (
-                    <div className="mt-5 rounded-lg border border-gray-300 p-4">
-                      <p className="dashboard-muted text-xs font-semibold uppercase tracking-wider">
-                        AI Clinical Summary
-                      </p>
+        {tab === "calls" && <CallHistory patientId={patient.id} />}
 
-                      <p className="mt-2 text-sm leading-6">
-                        {referral.ai_summary}
-                      </p>
-                    </div>
-                  )}
+        {tab === "rx" && (
+          <PrescriptionsPanel
+            patientId={patient.id} rows={rx.rows} tableMissing={rx.tableMissing} onChanged={() => void load()}
+            allergies={allergyList} conditions={conditionList} pregnant={reported?.pregnant}
+            referralId={referrals.find((r) => r.status === "accepted" || r.status === "pending")?.id ?? null}
+          />
+        )}
 
-                  {referral.ai_recommendation && (
-                    <div className="mt-4 rounded-lg border border-gray-300 p-4">
-                      <p className="dashboard-muted text-xs font-semibold uppercase tracking-wider">
-                        AI Recommendation
-                      </p>
-
-                      <p className="mt-2 text-sm leading-6">
-                        {referral.ai_recommendation}
-                      </p>
-                    </div>
-                  )}
-
-                  <div className="mt-5">
-                    <Link
-                      href={`/dashboard/referrals/${referral.id}`}
-                      className="dashboard-hover-glow inline-flex rounded-lg border-2 border-[#D4AF37] px-5 py-2.5 text-sm font-bold transition-all hover:bg-[#D4AF37] hover:text-black"
-                    >
-                      View Referral
-                    </Link>
+        {tab === "referrals" && (
+          referrals.length === 0 ? <div className="card"><EmptyState title="No referrals to this hospital" /></div> : (
+            <div className="space-y-4">
+              {referrals.map((r) => (
+                <article key={r.id} className="card p-5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className={statusBadge(r.status)}>{r.status}</span>
+                    <span className={urgencyBadge(r.urgency)}>{r.urgency}</span>
+                    <span className="text-muted ml-auto text-sm">{fmtDateTime(r.created_at)}</span>
                   </div>
+                  <p className="mt-3 font-semibold">{r.reason}</p>
+                  <div className="mt-3 grid gap-4 sm:grid-cols-2">
+                    <InfoItem label="Required service" value={r.required_service} />
+                    <InfoItem label="Recommended department" value={r.recommended_department} />
+                  </div>
+                  {r.ai_summary && <p className="text-muted mt-3 text-sm"><b>AI summary:</b> {r.ai_summary}</p>}
+                  <Link href={`/dashboard/referrals/${r.id}`} className="btn btn-sm mt-4">Open referral</Link>
                 </article>
               ))}
             </div>
-          )}
-        </section>
+          )
+        )}
 
-        {/* Voxera calls, conversations & summaries */}
-        <CallHistory patientId={patient.id} />
-
-        {/* Appointments */}
-        <section className="dashboard-panel mt-6 rounded-2xl border-2 border-[#D4AF37] p-8">
-          <div>
-            <p className="dashboard-muted text-sm font-semibold uppercase tracking-widest">
-              Appointment History
-            </p>
-
-            <h2 className="mt-2 text-2xl font-bold">
-              Appointments
-            </h2>
-          </div>
-
-          {appointments.length === 0 ? (
-            <div className="dashboard-subtle mt-6 rounded-xl border border-gray-300 p-6 text-center">
-              <p className="font-semibold">
-                No appointments found
-              </p>
-
-              <p className="dashboard-muted mt-2 text-sm">
-                Appointments created for this patient will appear here.
-              </p>
-            </div>
-          ) : (
-            <div className="mt-6 overflow-x-auto">
-              <table className="w-full min-w-[700px] border-collapse">
-                <thead>
-                  <tr className="border-b-2 border-[#D4AF37] text-left">
-                    <th className="px-4 py-3 text-sm font-bold">
-                      Date
-                    </th>
-
-                    <th className="px-4 py-3 text-sm font-bold">
-                      Time
-                    </th>
-
-                    <th className="px-4 py-3 text-sm font-bold">
-                      Department
-                    </th>
-
-                    <th className="px-4 py-3 text-sm font-bold">
-                      Doctor
-                    </th>
-
-                    <th className="px-4 py-3 text-sm font-bold">
-                      Status
-                    </th>
-                  </tr>
-                </thead>
-
+        {tab === "appointments" && (
+          appointments.length === 0 ? <div className="card"><EmptyState title="No appointments" hint="Appointments scheduled for this patient appear here." /></div> : (
+            <div className="card overflow-x-auto">
+              <table className="table">
+                <thead><tr><th>Date</th><th>Time</th><th>Department</th><th>Doctor</th><th>Status</th></tr></thead>
                 <tbody>
-                  {appointments.map((appointment) => (
-                    <tr
-                      key={appointment.id}
-                      className="border-b border-gray-300"
-                    >
-                      <td className="px-4 py-4 text-sm">
-                        {formatDate(
-                          appointment.appointment_date
-                        )}
-                      </td>
-
-                      <td className="px-4 py-4 text-sm">
-                        {formatTime(
-                          appointment.appointment_time
-                        )}
-                      </td>
-
-                      <td className="px-4 py-4 text-sm">
-                        {appointment.department ??
-                          "Not specified"}
-                      </td>
-
-                      <td className="px-4 py-4 text-sm">
-                        {appointment.doctor_name ??
-                          "Not specified"}
-                      </td>
-
-                      <td className="px-4 py-4">
-                        <span
-                          className={`rounded-full border-2 px-3 py-1 text-xs font-bold uppercase ${getStatusClass(
-                            appointment.status
-                          )}`}
-                        >
-                          {appointment.status}
-                        </span>
-                      </td>
+                  {appointments.map((a) => (
+                    <tr key={a.id}>
+                      <td>{fmtDate(a.appointment_date)}</td>
+                      <td>{fmtTime(a.appointment_time)}</td>
+                      <td>{a.department ?? "—"}</td>
+                      <td>{a.doctor_name ?? "—"}</td>
+                      <td><span className={statusBadge(a.status)}>{a.status}</span></td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
-          )}
-        </section>
-
+          )
+        )}
       </div>
-    </main>
+
+      {editing && (
+        <EditPatientModal
+          open={editing} onClose={() => setEditing(false)} patient={patient}
+          reported={{ allergies: reported?.allergies ?? [], conditions: reported?.conditions ?? [] }}
+          onSaved={() => void load()}
+        />
+      )}
+    </Page>
   );
 }
 
-// --------------------------------------------------
-// Reusable information component
-// --------------------------------------------------
-
-function InfoItem({
-  label,
-  value,
-}: {
-  label: string;
-  value: string;
-}) {
+function ListRow({ label, items }: { label: string; items: string[] }) {
   return (
     <div>
-      <p className="dashboard-muted text-xs font-semibold uppercase tracking-wider">
-        {label}
-      </p>
-
-      <p className="mt-1 font-medium">
-        {value}
-      </p>
+      <p className="eyebrow">{label}</p>
+      {items.length === 0 ? <p className="text-muted mt-1">None reported</p> : (
+        <div className="mt-1 flex flex-wrap gap-1.5">{items.map((i) => <Badge key={i}>{i}</Badge>)}</div>
+      )}
     </div>
   );
 }

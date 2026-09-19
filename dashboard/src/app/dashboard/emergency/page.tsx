@@ -1,352 +1,165 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import Link from "next/link";
+import { useCallback, useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
+import { useStaff } from "@/lib/staff";
+import { getPatientsMap, type PatientLite } from "@/lib/voxera";
+import { fmtDateTime, timeAgo, waiting } from "@/lib/format";
+import { Avatar, Badge, Callout, EmptyState, LoadingRows, Page, PageHeader, SectionCard, StatCard } from "../components/ui";
+import Icon from "../components/Icon";
 
-type EmergencyCase = {
-  id: string;
-  patient_id: string;
-  facility_id: string;
-  referral_id: string | null;
-  priority: string;
-  status: string;
-  symptoms_summary: string | null;
-  immediate_action: string | null;
-  created_at: string;
-};
-
-type Patient = {
-  id: string;
-  full_name: string;
-  phone: string | null;
-  gender: string | null;
-  age: number | null;
+type Case = {
+  id: string; patient_id: string; referral_id: string | null; priority: string; status: string;
+  symptoms_summary: string | null; immediate_action: string | null; created_at: string;
+  updated_at?: string | null;
 };
 
 export default function EmergencyPage() {
-  const [cases, setCases] = useState<EmergencyCase[]>([]);
-  const [patients, setPatients] = useState<Record<string, Patient>>({});
-  const [loading, setLoading] = useState(true);
+  const { facilityId, tick, refresh } = useStaff();
+  const [cases, setCases] = useState<Case[]>([]);
+  const [patients, setPatients] = useState<Record<string, PatientLite>>({});
+  const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState<{ tone: "success" | "warning"; text: string } | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [, force] = useState(0);
 
+  // keep the "waiting" timers ticking
   useEffect(() => {
-    loadEmergencyCases();
+    const t = setInterval(() => force((n) => n + 1), 30000);
+    return () => clearInterval(t);
   }, []);
 
-  async function loadEmergencyCases() {
-    setLoading(true);
+  const load = useCallback(async () => {
+    if (!facilityId) return;
+    const { data, error: err } = await supabase
+      .from("emergency_cases").select("*")
+      .eq("facility_id", facilityId).order("created_at", { ascending: false }).limit(200);
+    if (err) { setError("Unable to load emergency cases: " + err.message); setLoaded(true); return; }
     setError("");
+    const rows = (data ?? []) as Case[];
+    setCases(rows);
+    setPatients(await getPatientsMap(rows.map((r) => r.patient_id)));
+    setLoaded(true);
+  }, [facilityId]);
 
-    try {
-      const {
-        data: { user },
-      } = await supabase.auth.getUser();
+  useEffect(() => { void load(); }, [load, tick]);
 
-      if (!user) {
-        setError("You are not logged in.");
-        setLoading(false);
-        return;
-      }
-
-      const { data: hospitalUser, error: hospitalUserError } =
-        await supabase
-          .from("hospital_users")
-          .select("facility_id")
-          .eq("user_id", user.id)
-          .single();
-
-      if (hospitalUserError) {
-        throw hospitalUserError;
-      }
-
-      const facilityId = hospitalUser.facility_id;
-
-      const { data: emergencyData, error: emergencyError } = await supabase
-        .from("emergency_cases")
-        .select("*")
-        .eq("facility_id", facilityId)
-        .order("created_at", { ascending: false });
-
-      if (emergencyError) {
-        throw emergencyError;
-      }
-
-      const emergencyCases = emergencyData || [];
-      setCases(emergencyCases);
-
-      if (emergencyCases.length > 0) {
-        const patientIds = [
-          ...new Set(emergencyCases.map((item) => item.patient_id)),
-        ];
-
-        const { data: patientData, error: patientError } = await supabase
-          .from("patients")
-          .select("id, full_name, phone, gender")
-          .in("id", patientIds);
-
-        if (patientError) {
-          throw patientError;
-        }
-
-        const patientMap: Record<string, Patient> = {};
-
-        (patientData || []).forEach((patient) => {
-          patientMap[patient.id] = {
-            ...patient,
-            age: calculateAge(patient.id, emergencyCases),
-          };
-        });
-
-        setPatients(patientMap);
-      } else {
-        setPatients({});
-      }
-    } catch (err) {
-      console.error(err);
-      setError("Unable to load emergency cases.");
-    } finally {
-      setLoading(false);
+  async function resolve(c: Case) {
+    if (!confirm(`Mark the emergency for ${patients[c.patient_id]?.full_name ?? "this patient"} as resolved?`)) return;
+    setBusy(c.id); setNotice(null);
+    const { data, error: err } = await supabase
+      .from("emergency_cases").update({ status: "resolved" }).eq("id", c.id).select("id");
+    setBusy(null);
+    if (err || !data || data.length === 0) {
+      setNotice({
+        tone: "warning",
+        text: "Could not mark resolved — your account isn't allowed to update emergency cases yet. Run sql/2026_dashboard_v2.sql once in the Supabase SQL Editor.",
+      });
+      return;
     }
+    setNotice({ tone: "success", text: "Emergency marked as resolved." });
+    refresh();
+    void load();
   }
 
-  function calculateAge(
-    patientId: string,
-    emergencyCases: EmergencyCase[]
-  ): number | null {
-    void patientId;
-    void emergencyCases;
-
-    return null;
-  }
-
-  function getPriorityLabel(priority: string) {
-    switch (priority.toLowerCase()) {
-      case "critical":
-        return "Critical";
-      case "high":
-        return "High";
-      case "medium":
-        return "Medium";
-      case "low":
-        return "Low";
-      default:
-        return priority;
-    }
-  }
-
-  function getPriorityClasses(priority: string) {
-    switch (priority.toLowerCase()) {
-      case "critical":
-        return "border-red-300 bg-red-50 text-red-700";
-      case "high":
-        return "border-orange-300 bg-orange-50 text-orange-700";
-      case "medium":
-        return "border-yellow-300 bg-yellow-50 text-yellow-700";
-      default:
-        return "border-gray-300 bg-gray-50 text-gray-700";
-    }
-  }
-
-  function getStatusClasses(status: string) {
-    switch (status.toLowerCase()) {
-      case "active":
-        return "border-red-300 bg-red-50 text-red-700";
-      case "resolved":
-        return "border-green-300 bg-green-50 text-green-700";
-      case "cancelled":
-        return "border-gray-300 bg-gray-50 text-gray-600";
-      default:
-        return "border-gray-300 bg-gray-50 text-gray-700";
-    }
-  }
-
-  const activeCases = cases.filter(
-    (item) => item.status.toLowerCase() === "active"
-  );
-
-  const resolvedCases = cases.filter(
-    (item) => item.status.toLowerCase() === "resolved"
-  );
+  const active = cases.filter((c) => c.status === "active");
+  const closed = cases.filter((c) => c.status !== "active");
 
   return (
-    <div className="dashboard-page">
-      <div className="mx-auto max-w-7xl px-6 py-8">
-        {/* Header */}
-        <div className="mb-8 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-          <div>
-            <p className="mb-2 text-sm font-medium uppercase tracking-wider dashboard-muted">
-              Hospital Emergency Management
-            </p>
+    <Page>
+      <PageHeader
+        eyebrow="Emergency management"
+        title="Emergency board"
+        subtitle="Patients Voxera flagged as emergencies and routed to this hospital. Oldest waiting first."
+        actions={<button className="btn" onClick={() => { refresh(); void load(); }}><Icon name="refresh" size={16} /> Refresh</button>}
+      />
 
-            <h1 className="text-3xl font-bold tracking-tight">
-              🚨 Emergency Cases
-            </h1>
-
-            <p className="mt-2 text-sm dashboard-muted">
-              Monitor emergency cases currently assigned to your hospital.
-            </p>
-          </div>
-
-          <button
-            onClick={loadEmergencyCases}
-            className="dashboard-hover-glow rounded-xl border border-[var(--dashboard-border)] bg-[var(--dashboard-surface)] px-4 py-2 text-sm font-semibold transition"
-          >
-            Refresh
-          </button>
-        </div>
-
-        {/* Summary */}
-        <div className="mb-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          <div className="dashboard-panel rounded-2xl border border-[var(--dashboard-border)] p-5 shadow-sm">
-            <p className="text-sm dashboard-muted">Active Emergencies</p>
-
-            <p className="mt-2 text-3xl font-bold">
-              {loading ? "—" : activeCases.length}
-            </p>
-          </div>
-
-          <div className="dashboard-panel rounded-2xl border border-[var(--dashboard-border)] p-5 shadow-sm">
-            <p className="text-sm dashboard-muted">Total Emergency Cases</p>
-
-            <p className="mt-2 text-3xl font-bold">
-              {loading ? "—" : cases.length}
-            </p>
-          </div>
-
-          <div className="dashboard-panel rounded-2xl border border-[var(--dashboard-border)] p-5 shadow-sm">
-            <p className="text-sm dashboard-muted">Resolved Cases</p>
-
-            <p className="mt-2 text-3xl font-bold">
-              {loading ? "—" : resolvedCases.length}
-            </p>
-          </div>
-        </div>
-
-        {/* Error */}
-        {error && (
-          <div className="mb-6 rounded-xl border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-700">
-            {error}
-          </div>
-        )}
-
-        {/* Loading */}
-        {loading ? (
-          <div className="dashboard-panel rounded-2xl border border-[var(--dashboard-border)] p-10 text-center shadow-sm">
-            <p className="text-sm dashboard-muted">
-              Loading emergency cases...
-            </p>
-          </div>
-        ) : cases.length === 0 ? (
-          /* Empty State */
-          <div className="dashboard-panel rounded-2xl border border-[var(--dashboard-border)] p-12 text-center shadow-sm">
-            <div className="text-5xl">🚨</div>
-
-            <h2 className="mt-4 text-xl font-bold">
-              No emergency cases
-            </h2>
-
-            <p className="mx-auto mt-2 max-w-md text-sm dashboard-muted">
-              Emergency cases will appear here when a case is assigned to
-              this hospital.
-            </p>
-          </div>
-        ) : (
-          /* Emergency Cases */
-          <div className="space-y-5">
-            {cases.map((emergencyCase) => {
-              const patient = patients[emergencyCase.patient_id];
-
-              return (
-                <div
-                  key={emergencyCase.id}
-                  className="dashboard-panel dashboard-hover-glow rounded-2xl border border-[var(--dashboard-border)] p-6 shadow-sm"
-                >
-                  <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
-                    {/* Patient / Case */}
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-3">
-                        <h2 className="text-xl font-bold">
-                          {patient?.full_name || "Patient"}
-                        </h2>
-
-                        <span
-                          className={`rounded-full border px-3 py-1 text-xs font-semibold ${getPriorityClasses(
-                            emergencyCase.priority
-                          )}`}
-                        >
-                          {getPriorityLabel(emergencyCase.priority)}
-                        </span>
-
-                        <span
-                          className={`rounded-full border px-3 py-1 text-xs font-semibold ${getStatusClasses(
-                            emergencyCase.status
-                          )}`}
-                        >
-                          {emergencyCase.status}
-                        </span>
-                      </div>
-
-                      <div className="mt-4 grid gap-4 sm:grid-cols-2">
-                        <div>
-                          <p className="text-xs uppercase tracking-wide dashboard-muted">
-                            Symptoms
-                          </p>
-
-                          <p className="mt-1 text-sm">
-                            {emergencyCase.symptoms_summary ||
-                              "No symptoms summary available."}
-                          </p>
-                        </div>
-
-                        <div>
-                          <p className="text-xs uppercase tracking-wide dashboard-muted">
-                            Immediate Action
-                          </p>
-
-                          <p className="mt-1 text-sm">
-                            {emergencyCase.immediate_action ||
-                              "No immediate action recorded."}
-                          </p>
-                        </div>
-                      </div>
-
-                      {patient && (
-                        <div className="mt-5 flex flex-wrap gap-x-6 gap-y-2 text-sm dashboard-muted">
-                          {patient.phone && (
-                            <span>📞 {patient.phone}</span>
-                          )}
-
-                          {patient.gender && (
-                            <span>Gender: {patient.gender}</span>
-                          )}
-                        </div>
-                      )}
-
-                      <p className="mt-4 text-xs dashboard-muted">
-                        Created{" "}
-                        {new Date(
-                          emergencyCase.created_at
-                        ).toLocaleString()}
-                      </p>
-                    </div>
-
-                    {/* Action */}
-                    {emergencyCase.referral_id && (
-                      <Link
-                        href={`/dashboard/referrals/${emergencyCase.referral_id}`}
-                        className="shrink-0 rounded-xl border border-[var(--dashboard-border)] px-4 py-2 text-sm font-semibold transition hover:bg-[var(--dashboard-surface-muted)]"
-                      >
-                        View Referral
-                      </Link>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
+      <div className="mb-6 grid gap-4 sm:grid-cols-3">
+        <StatCard label="Active now" value={loaded ? active.length : "—"} tone={active.length ? "critical" : "success"} pulse={active.length > 0} />
+        <StatCard label="Resolved" value={loaded ? closed.filter((c) => c.status === "resolved").length : "—"} />
+        <StatCard label="All time" value={loaded ? cases.length : "—"} />
       </div>
-    </div>
+
+      {error && <Callout tone="critical" className="mb-4">{error}</Callout>}
+      {notice && <Callout tone={notice.tone} className="mb-4">{notice.text}</Callout>}
+
+      {!loaded ? <LoadingRows rows={3} /> : (
+        <div className="space-y-6">
+          <SectionCard title="Active emergencies" padded={false}>
+            {active.length === 0 ? (
+              <EmptyState icon="✓" title="No active emergencies" hint="New emergencies appear here instantly with an alert." />
+            ) : (
+              <ul className="divide-y" style={{ borderColor: "var(--dashboard-border)" }}>
+                {[...active].reverse().map((c) => {
+                  const p = patients[c.patient_id];
+                  return (
+                    <li key={c.id} className="triage triage-critical px-5 py-5">
+                      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                        <div className="flex min-w-0 gap-3">
+                          <Avatar name={p?.full_name} tone="critical" size={46} />
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <Link href={`/dashboard/patients/${c.patient_id}`} className="text-lg font-bold hover:underline">
+                                {p?.full_name ?? "Unknown patient"}
+                              </Link>
+                              <Badge tone="critical">{c.priority}</Badge>
+                              <span className="badge badge-critical"><Icon name="clock" size={12} /> waiting {waiting(c.created_at)}</span>
+                            </div>
+                            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                              <div>
+                                <p className="eyebrow">Symptoms</p>
+                                <p className="mt-1 text-sm font-medium">{c.symptoms_summary ?? "Not recorded"}</p>
+                              </div>
+                              <div>
+                                <p className="eyebrow">Immediate action</p>
+                                <p className="mt-1 text-sm font-medium">{c.immediate_action ?? "Not recorded"}</p>
+                              </div>
+                            </div>
+                            <p className="text-muted mt-3 text-xs">Flagged {fmtDateTime(c.created_at)} ({timeAgo(c.created_at)})</p>
+                          </div>
+                        </div>
+                        <div className="flex shrink-0 flex-wrap gap-2 lg:flex-col lg:items-stretch">
+                          {p?.phone && <a href={`tel:${p.phone}`} className="btn btn-lg"><Icon name="phone" size={16} /> {p.phone}</a>}
+                          {c.referral_id && <Link href={`/dashboard/referrals/${c.referral_id}`} className="btn btn-danger">Open referral</Link>}
+                          <Link href={`/dashboard/patients/${c.patient_id}`} className="btn">Patient record</Link>
+                          <button className="btn btn-success" disabled={busy === c.id} onClick={() => void resolve(c)}>
+                            <Icon name="check" size={16} /> {busy === c.id ? "Saving…" : "Mark resolved"}
+                          </button>
+                        </div>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </SectionCard>
+
+          {closed.length > 0 && (
+            <SectionCard title="Previous cases" padded={false}>
+              <div className="overflow-x-auto">
+                <table className="table">
+                  <thead><tr><th>Patient</th><th>Symptoms</th><th>Status</th><th>Flagged</th><th /></tr></thead>
+                  <tbody>
+                    {closed.map((c) => (
+                      <tr key={c.id}>
+                        <td className="font-semibold">
+                          <Link href={`/dashboard/patients/${c.patient_id}`} className="hover:underline">{patients[c.patient_id]?.full_name ?? "Unknown"}</Link>
+                        </td>
+                        <td className="text-muted max-w-xs truncate">{c.symptoms_summary ?? "—"}</td>
+                        <td><Badge tone={c.status === "resolved" ? "success" : undefined}>{c.status}</Badge></td>
+                        <td className="text-muted whitespace-nowrap">{fmtDateTime(c.created_at)}</td>
+                        <td>{c.referral_id && <Link href={`/dashboard/referrals/${c.referral_id}`} className="btn btn-sm">Referral</Link>}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </SectionCard>
+          )}
+        </div>
+      )}
+    </Page>
   );
 }
