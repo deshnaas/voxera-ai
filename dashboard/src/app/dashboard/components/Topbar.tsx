@@ -33,9 +33,11 @@ export default function Topbar({
         borderColor: "var(--dashboard-border)",
       }}
     >
-      <button className="btn btn-ghost lg:hidden" onClick={onMenu} aria-label="Open menu">
-        <Icon name="menu" size={20} />
-      </button>
+      <div className="lg:hidden">   {/* the sidebar is always visible on desktop; this menu button is for phones/tablets */}
+        <button className="btn btn-ghost" onClick={onMenu} aria-label="Open menu">
+          <Icon name="menu" size={20} />
+        </button>
+      </div>
 
       <PatientSearch />
 

@@ -155,6 +155,11 @@ body {
 .btn-success:hover { background: #15803d; }
 .btn-ghost { background: transparent; border-color: transparent; color: var(--dashboard-muted); }
 .btn-ghost:hover { background: var(--dashboard-surface-muted); color: var(--dashboard-text); }
+/* .btn sets display, which would beat Tailwind's responsive show/hide utilities; restore them for buttons */
+.btn.hidden { display: none; }
+@media (min-width: 640px)  { .btn.sm\:inline-flex { display: inline-flex; } }
+@media (min-width: 768px)  { .btn.md\:inline-flex { display: inline-flex; } }
+@media (min-width: 1024px) { .btn.lg\:hidden { display: none; } }
 
 /* form controls */
 .input, .select, .textarea {

@@ -28,3 +28,24 @@ requests==2.34.2
 ollama==0.6.2
 supabase==2.31.0
 python-dotenv==1.2.3
+
+# --- Patient Intelligence (voxera_patientfetch) ---------------------------
+# Prescription OCR: PaddleOCR detection/recognition models on ONNX (no PaddlePaddle framework)
+rapidocr-onnxruntime==1.4.4
+pypdf==6.19.0
+pypdfium2==5.13.0
+# Patient-records API (dashboard talks to this; the service-role key never leaves the server)
+fastapi==0.141.1
+uvicorn==0.53.0
+python-multipart==0.0.32
+# Tests / SQL validation
+pytest==9.1.1
+pglast==8.4
+# NOTE: SpeechBrain (voice-signal model) is NOT installed here. It needs torchaudio, which has no build
+# for torch 2.13, so it lives in an isolated venv: see voxera_patientfetch/requirements_voice.txt
+
+# --- Multilingual voice (voxera_multilang) --------------------------------
+# int8 CTranslate2 Whisper, built locally from the small.pt already on disk:
+#   python -m voxera_multilang.build_fast_stt
+faster-whisper==1.2.1
+ctranslate2==4.8.2

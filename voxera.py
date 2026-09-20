@@ -37,6 +37,28 @@ except Exception as e:
     print(f"[BOOT] Supabase layer unavailable ({e}); running without persistence.")
     DB_OK = False
 
+# Multilingual voice (Hindi / Marathi / English). Optional: VOXERA_MULTILANG=0, a missing model or package
+# falls back to English-only, exactly as before.
+ML_OK = False
+if os.getenv("VOXERA_MULTILANG", "1").strip() != "0":
+    try:
+        from voxera_multilang.integration import MultiLang
+        from voxera_multilang import safety as ml_safety
+        ML_OK = True
+    except Exception as e:
+        print(f"[BOOT] multilingual layer unavailable ({type(e).__name__}); English only.")
+
+# Patient Intelligence (patient-ID verification, record Q&A, adaptive triage, voice signal).
+# Optional: VOXERA_PATIENTFETCH=0 or a missing migration falls back to the classic flow.
+PF_OK = False
+PF_PHRASES = []
+if DB_OK and os.getenv("VOXERA_PATIENTFETCH", "1").strip() != "0":
+    try:
+        from voxera_patientfetch.call_integration import CallAssistant, PHRASES as PF_PHRASES
+        PF_OK = True
+    except Exception as e:
+        print(f"[BOOT] Patient Intelligence layer unavailable ({type(e).__name__}); using the classic call flow.")
+
 
 # ============================================================
 # PROMPT — written for the ear, not the page
@@ -111,6 +133,9 @@ class Call:
         # collected for the end-of-call structured summary
         self.emergency_result = None
         self.care_events = []
+        self.pf = None                      # CallAssistant when Patient Intelligence is active
+        self.ml = None                      # MultiLang when the multilingual voice is active
+        self._logged_lang = None
 
     # -- state helper --------------------------------------------------
     def to(self, new):
@@ -143,6 +168,15 @@ class Call:
             self.call_id = call["id"]
             print(f"[DB] patient={self.patient_id}  call={self.call_id}  "
                   f"facility={fac}")
+            if PF_OK:
+                try:
+                    pf = CallAssistant(db, caller_phone=phone)
+                    self.pf = pf if pf.enabled else None
+                    if self.pf:
+                        print("[PATIENT_AI] patient-ID verification is ON for this call.")
+                except Exception as e:
+                    print(f"[PATIENT_AI] disabled for this call ({type(e).__name__}).")
+                    self.pf = None
         except Exception as e:
             print(f"[DB] could not open call ({e}); continuing without persistence.")
             self.call_id = None
@@ -197,6 +231,15 @@ class Call:
                 emergency=self.emergency_result, care_events=self.care_events,
                 referral=referral, appointment=appt, outcome=outcome,
             )
+            if self.pf:
+                try:
+                    s.update(self.pf.summary_extras())     # voice_signal / clinical_context / record_context
+                except Exception:
+                    pass
+            if self.ml_on and self.ml.tracker.decided:
+                from voxera_multilang.lang import NAMES
+                s["language"] = {"reply_language": NAMES[self.ml.lang], "switches": self.ml.tracker.switches,
+                                 "note": "Hindi/Marathi replies are curated wording, not generated text."}
             text = summary.render_text(s)
             print("\n" + text + "\n")
             if DB_OK and self.call_id:
@@ -237,8 +280,96 @@ class Call:
             print("[ESCALATION] (no DB) would create referral: "
                   f"{result.category} / {result.trigger}")
 
+    # -- multilingual helpers -------------------------------------------------
+    @property
+    def ml_on(self):
+        return bool(self.ml and self.ml.enabled)
+
+    @property
+    def lang(self):
+        return self.ml.lang if self.ml_on else "en"
+
+    def log_language(self):
+        """Store the language the call is being held in (calls.language) once it is known / changes."""
+        if not (self.ml_on and self.ml.tracker.decided and self.call_id and self.ml.lang != self._logged_lang):
+            return
+        self._logged_lang = self.ml.lang
+        if self.writer:
+            from voxera_multilang.lang import NAMES
+            self.writer.submit(lambda: db.supabase.table("calls").update(
+                {"language": NAMES[self.ml.lang]}).eq("id", self.call_id).execute())
+
+    # -- Patient Intelligence hooks ---------------------------------------
+    def finish_reply(self, reply, mic):
+        """Speak + record a reply produced by the patient-intelligence layer (no LLM)."""
+        if self.ml_on:
+            reply = self.ml.localize(reply)               # fixed English lines -> the caller's language
+        self.mem.add_assistant(reply)
+        self.persist_turn("ai", reply)
+        self.ai_response_count += 1
+        print(f"\nVOXERA: {reply}\n")
+        self.to(S.SPEAKING)
+        res = vx.speak(reply, tracker=self.tracker, allow_barge_in=True, mic=mic)
+        if res.get("interrupted"):
+            self.interruption_count += 1
+            print(f"[BARGE] interruption #{self.interruption_count} — "
+                  "processing what the patient said.")
+        return res
+
+    def handle_id_turn(self, text, mic):
+        """Patient-ID phase: verify, then carry on with any complaint already given."""
+        self.to(S.PROCESSING)
+        out = self.pf.id_turn(text)
+        if out.verified:
+            pid = self.pf.rebind_call(self.call_id)      # calls.patient_id stays NOT NULL
+            if pid:
+                self.patient_id = pid
+                self.patient = self.pf.patient
+            if self.ml_on:                                # the record's language preference is a tiebreak for hi vs mr
+                pref = str((self.pf.patient or {}).get("preferred_language") or "").strip().lower()
+                self.ml.tracker.preferred = {"hindi": "hi", "marathi": "mr", "english": "en"}.get(pref)
+        res = self.finish_reply(out.text, mic)
+        if out.finished and out.complaint and not (res or {}).get("interrupted"):
+            self.mem.add_user(out.complaint)             # what they said before giving the ID
+            return self.handle_normal(out.complaint, mic)
+        return res
+
+    def handle_pf(self, text, mic):
+        """Record questions, then adaptive clarification. Returns None to fall through
+        to the classic care / LLM path. The frozen emergency detector has ALREADY run."""
+        pf = self.pf
+        ans = pf.record_reply(
+            text, llm=lambda sysp, u: vx.llm_respond(sysp, [], u, tracker=None,
+                                                     temperature=0.1, max_tokens=90))
+        if ans is not None:
+            pf.audit(self.call_id, "ask_question")
+            if self.ml_on:
+                ans = self.ml.record_text(ans, getattr(pf, "last_frame", None))
+            return self.finish_reply(ans, mic)
+
+        step = pf.triage_step(text, self.mem.last_assistant())
+        if step.kind == "emergency":                     # detector fired on the caller's own combined words
+            emg = self.ml.localize_emergency(step.emergency) if self.ml_on else step.emergency
+            self.handle_emergency(text, emg, mic)
+            return {"ok": True, "interrupted": False, "pending_audio": None}
+        if step.kind == "ask":
+            return self.finish_reply(self.ml.triage_text(step) if self.ml_on else step.text, mic)
+        if step.kind == "conclude":
+            print(f"[TRIAGE] conclusion={step.conclusion}")
+            if step.conclusion == "URGENT_CLINICAL_REVIEW" and self.writer and self.call_id:
+                self.writer.submit(pf.escalate_urgent, self.call_id, self.patient_id,
+                                   (self.patient or {}).get("full_name", "Unknown caller"))
+            return self.finish_reply(self.ml.triage_text(step) if self.ml_on else step.text, mic)
+        return None
+
     def handle_normal(self, patient_text, mic):
         self.to(S.PROCESSING)
+
+        if self.pf:
+            self.pf.seed_facts(self.mem.facts)           # verified allergies/conditions -> OTC safety checks
+            r = self.handle_pf(patient_text, mic)
+            if r is not None:
+                return r
 
         fl = vx.facts_line(self.mem.facts)
         if fl:
@@ -260,12 +391,16 @@ class Call:
                   + (f"  otc={otc.items or 'deferred' if otc else None}"
                      if otc else "  otc=none"))
             self.tracker.mark("ai_start")
-            reply = care.render(
-                cg, otc, patient_text,
-                llm=lambda sysp, hist, u: vx.llm_respond(
-                    sysp, hist, u, tracker=None, temperature=0.3,
-                    max_tokens=120),
-            )
+            if self.ml_on and self.lang != "en":
+                # Hindi / Marathi: the curated guidance is spoken from the reviewed catalog; the LLM is not used
+                reply = self.ml.care_text(cg, otc, profile)
+            if reply is None:
+                reply = care.render(
+                    cg, otc, patient_text,
+                    llm=lambda sysp, hist, u: vx.llm_respond(
+                        sysp, hist, u, tracker=None, temperature=0.3,
+                        max_tokens=120),
+                )
             self.tracker.mark("ai_first_token")
             self.tracker.mark("ai_end")
             given.append(cg.care_id)
@@ -281,6 +416,13 @@ class Call:
         # --------------------------------------------------------
         # NORMAL CONVERSATIONAL PATH (unchanged)
         # --------------------------------------------------------
+        if reply is None and self.ml_on and self.lang != "en":
+            # The local LLM cannot be trusted to write Hindi/Marathi for a medical assistant (it produces
+            # wrong or echoed sentences), so these turns use reviewed, deterministic wording instead.
+            self.tracker.mark("ai_start")
+            reply = self.ml.generic_reply(patient_text)
+            self.tracker.mark("ai_first_token")
+            self.tracker.mark("ai_end")
         if reply is None:
             # Injecting the compact state into the prompt confuses qwen3:1.7b
             # (it starts summarising). The rolling history already prevents
@@ -297,7 +439,7 @@ class Call:
                 tracker=self.tracker,
             )
         if not reply:
-            reply = FALLBACK_REPLY
+            reply = self.ml.say("fallback") if self.ml_on else FALLBACK_REPLY
 
         self.mem.add_assistant(reply)
         self.persist_turn("ai", reply)
@@ -321,28 +463,68 @@ class Call:
         print(f"[AUDIO] captured {len(audio)/vx.SAMPLE_RATE:.1f}s  "
               f"(rms={vx.rms(audio):.4f} peak={vx.peak(audio):.3f})")
 
-        text = vx.transcribe(audio, tracker=self.tracker)
+        turn = None
+        if self.ml_on:
+            # language ID first; English keeps the existing base.en path, Hindi/Marathi use the multilingual model
+            turn = self.ml.transcribe_turn(audio, lambda a: vx.transcribe(a, tracker=self.tracker))
+            if turn.path == "multilingual":
+                self.tracker.mark("stt_start")
+                self.tracker.mark("stt_end")
+            text, text_en = turn.native, (turn.english or turn.native)
+        else:
+            text = vx.transcribe(audio, tracker=self.tracker)
+            text_en = text
         if not text or len(text.strip()) < 2:
             print("[AUDIO] no reliable speech — listening again.")
             return None
 
         print("\n" + "-" * 62)
         print(f"PATIENT: {text}")
+        if turn is not None and turn.path == "multilingual":
+            print(f"   (English understanding: {text_en})")
         print("-" * 62)
 
         context = self.mem.context_excluding_last_user()
         last_ai = self.mem.last_assistant()
 
-        self.mem.add_user(text)
-        self.persist_turn("patient", text)
+        if self.pf:
+            self.pf.submit_audio(audio)      # voice signal: async, AFTER Whisper, never blocks the turn
 
-        emg = check_emergency(text, context=context, last_assistant=last_ai)
+        # what the English-only logic sees, and what is written to the transcript
+        id_text = text_en
+        if self.pf and self.pf.awaiting_id:
+            from voxera_multilang.safety import normalize_spoken_id_text
+            cands = [normalize_spoken_id_text(text), text_en, text] if self.ml_on else [text]
+            id_text = self.pf.pick_id_reading(cands) or next((c for c in cands if self.pf.looks_like_id(c)), text_en)
+        shown = text_en
+        shown_native = text
+        if self.pf and self.pf.awaiting_id and self.pf.looks_like_id(id_text):
+            shown = shown_native = "[patient ID provided]"  # the spoken ID is not stored in transcripts / LLM memory
+        self.mem.add_user(shown)
+        self.persist_turn("patient", shown_native)
+        if turn is not None and turn.path == "multilingual" and shown_native != "[patient ID provided]":
+            self.persist_turn("system", f"translation_en: {text_en}")
+        self.log_language()
+
+        if turn is not None and self.ml.maybe_switch_on_request(turn):
+            self.log_language()
+            return self.finish_reply(self.ml.say("lang_switched"), mic)
+
+        # The FROZEN emergency detector always runs first — even before ID verification.
+        # For Hindi/Marathi it is fed English renderings of the same words (safety.py); only the SPOKEN reply is localised.
+        if turn is not None:
+            emg = self.ml.emergency(check_emergency, turn, context=context, last_assistant=last_ai)
+        else:
+            emg = check_emergency(text, context=context, last_assistant=last_ai)
         if emg:
-            self.handle_emergency(text, emg, mic)
+            self.handle_emergency(text_en, emg, mic)
             res = {"ok": True, "interrupted": False, "pending_audio": None}
         else:
             print("[SAFETY] no emergency signal")
-            res = self.handle_normal(text, mic)
+            if self.pf and self.pf.awaiting_id:
+                res = self.handle_id_turn(id_text, mic)
+            else:
+                res = self.handle_normal(text_en, mic)
 
         self.tracker.mark("turn_end")
         rec = self.tracker.end_turn(extra={"state": self.state})
@@ -372,15 +554,33 @@ def main():
     vx.prewarm_phrases([GREETING, FALLBACK_REPLY] + CANNED_RESPONSES)
     call.open_supabase_call()
 
+    greeting = GREETING
+    if call.pf:
+        greeting = call.pf.greeting()          # "...Before we begin, could you please tell me your patient ID?"
+        if os.getenv("VOXERA_PREWARM_PF", "1") != "0":
+            vx.prewarm_phrases(PF_PHRASES)
+
+    if ML_OK:
+        call.ml = MultiLang(vx)
+        if call.ml.enabled:
+            call.ml.boot()                     # multilingual STT loads in the background; TTS hook installed
+            call.ml.prewarm_greeting(with_id=bool(call.pf))
+        if call.ml.enabled:
+            # the language is unknown until the caller speaks, so the first line is a short trilingual greeting
+            greeting = call.ml.greeting_text(with_id=bool(call.pf))
+            print("[LANG] multilingual voice ON: English / हिन्दी / मराठी (language is detected from the caller)")
+
     with vx.MicCapture() as mic:
         mic.calibrate()
+        if call.pf:
+            call.pf.warm()                     # emotion model loads in its own low-priority process
 
         # -- greeting ------------------------------------------
         call.to(S.GREETING)
-        call.mem.add_assistant(GREETING)
-        call.persist_turn("ai", GREETING)
-        print(f"\nVOXERA: {GREETING}\n")
-        vx.speak(GREETING, tracker=call.tracker, mic=mic)
+        call.mem.add_assistant(greeting)
+        call.persist_turn("ai", greeting)
+        print(f"\nVOXERA: {greeting}\n")
+        vx.speak(greeting, tracker=call.tracker, mic=mic)
 
         primed = None
         outcome = "completed"
@@ -411,6 +611,8 @@ def main():
                 call.writer.drain(timeout=8.0)   # let referral/turn writes land
             call.close_supabase_call(outcome)
             call.write_call_summary(outcome)
+            if call.pf:
+                call.pf.close()
             print(call.tracker.summary())
             print("\n[CALL] ended.\n")
 

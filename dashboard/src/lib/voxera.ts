@@ -5,6 +5,7 @@
 // agent writes. No mock data.
 
 import { supabase } from "@/lib/supabase";
+import type { PatientClinicalContext, RecordContext, VoiceSignal } from "@/lib/patientTypes";
 export { humanDuration } from "@/lib/format";
 
 // ------------------------------------------------------------
@@ -13,6 +14,7 @@ export { humanDuration } from "@/lib/format";
 
 export type Patient = {
   id: string;
+  patient_id?: string;          // human-facing ID, e.g. VX-000123 (after the patient-intelligence migration)
   full_name: string;
   phone: string | null;
   date_of_birth: string | null;
@@ -102,6 +104,10 @@ export type CallSummary = {
   follow_up?: Record<string, unknown> | null;
   call_outcome?: string | null;
   generated_at?: string;
+  // added by Patient Intelligence (optional)
+  voice_signal?: VoiceSignal;
+  clinical_context?: PatientClinicalContext;
+  record_context?: RecordContext;
 };
 
 export type Prescription = {

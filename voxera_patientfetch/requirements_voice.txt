@@ -1,0 +1,12 @@
+# Isolated venv for the SpeechBrain emotion-posterior worker (voice_worker.py).
+#   .venv312\Scripts\python.exe -m venv voxera_patientfetch\.venv_voice
+#   voxera_patientfetch\.venv_voice\Scripts\python.exe -m pip install -r voxera_patientfetch\requirements_voice.txt
+# Separate from the main venv because torchaudio has no release for torch 2.13 (the version Whisper/Kokoro use here).
+torch==2.11.0
+torchaudio==2.11.0
+speechbrain==1.1.1
+transformers<5
+numpy
+scipy
+soundfile
+huggingface_hub

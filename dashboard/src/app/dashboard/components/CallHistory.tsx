@@ -8,6 +8,7 @@ import {
 } from "@/lib/voxera";
 import { fmtDateTime } from "@/lib/format";
 import { Badge, EmptyState, LoadingRows } from "./ui";
+import VoiceSignalBadge from "./patient-intel/VoiceSignalBadge";
 
 // Real calls / conversation_turns / call summaries written by Voxera.
 
@@ -119,7 +120,13 @@ export function SummaryCard({ summary, text }: { summary: CallSummary; text: str
   const es = summary.emergency_status;
   return (
     <div className="rounded-xl border p-4" style={{ borderColor: "var(--dashboard-gold-border)", background: "var(--brand-soft)" }}>
-      <p className="eyebrow" style={{ color: "var(--brand-ink)" }}>Call summary</p>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="eyebrow" style={{ color: "var(--brand-ink)" }}>Call summary</p>
+        <VoiceSignalBadge signal={summary.voice_signal} detailed />
+      </div>
+      {summary.clinical_context?.conclusion && (
+        <p className="text-muted mt-2 text-xs">Triage conclusion: {summary.clinical_context.conclusion.replaceAll("_", " ").toLowerCase()}</p>
+      )}
 
       <div className="mt-3 grid gap-4 sm:grid-cols-2">
         <F label="Chief concern" value={summary.chief_concern ?? "—"} />

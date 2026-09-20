@@ -539,21 +539,38 @@ def llm_respond(system_prompt, history, patient_text,
 _tts_cache = {}          # exact-text -> ndarray  (fixed lines: greeting, emergencies)
 
 
-def _tts_key(text):
-    return re.sub(r"\s+", " ", (text or "").strip()).lower()
+# --- optional multilingual speech (voxera_multilang) ------------------------------------------
+# English is untouched. When a call switches to Hindi/Marathi, voxera.py sets the speech language and
+# synthesize() routes through the same Kokoro model with that language's phonemizer; playback, barge-in and
+# AEC are the same code path either way.
+_ml_synth = None         # callable(text, lang) -> float32 mono @ 24 kHz, or None
+_speak_lang = "en"
 
 
-def prewarm_phrases(phrases):
+def set_speech_language(lang, synth=None):
+    global _speak_lang, _ml_synth
+    _speak_lang = lang or "en"
+    if synth is not None:
+        _ml_synth = synth
+
+
+def _tts_key(text, lang=None):
+    lang = _speak_lang if lang is None else lang
+    k = re.sub(r"\s+", " ", (text or "").strip()).lower()
+    return k if lang == "en" or _ml_synth is None else f"{lang}:{k}"
+
+
+def prewarm_phrases(phrases, lang=None):
     """Pre-render fixed lines (greeting, canned emergency responses) so they
-    play instantly during the call."""
+    play instantly during the call. `lang` pre-renders them in Hindi/Marathi."""
     load_tts()
     for p in phrases:
         if not p:
             continue
-        k = _tts_key(p)
+        k = _tts_key(p, lang or "en")
         if k in _tts_cache:
             continue
-        a = _synth_raw(p)
+        a = _ml_synth(p, lang) if (lang and lang != "en" and _ml_synth is not None) else _synth_raw(p)
         if a is not None:
             _tts_cache[k] = a
     print(f"[BOOT] pre-rendered {len(_tts_cache)} fixed phrase(s)")
@@ -596,6 +613,13 @@ def synthesize(text, tracker=None):
         tracker.mark("tts_start")
     t = time.perf_counter()
     try:
+        if _speak_lang != "en" and _ml_synth is not None:
+            a = _ml_synth(text, _speak_lang)
+            if a is None:
+                return None
+            print(f"[TTS] synth[{_speak_lang}] {time.perf_counter()-t:.2f}s  "
+                  f"({len(a)/TTS_SAMPLE_RATE:.1f}s audio)  \"{text[:40]}\"")
+            return a
         phonemes = _goonj.phonemize(text, "en")
         if not phonemes:
             return None

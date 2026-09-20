@@ -55,6 +55,7 @@ export default function PatientsPage() {
         if (filter === "calls" && !lastCall[p.id]) return false;
         if (!term) return true;
         return (p.full_name ?? "").toLowerCase().includes(term) || (p.phone ?? "").includes(term)
+          || (p.patient_id ?? "").toLowerCase().includes(term)
           || (p.village_or_locality ?? "").toLowerCase().includes(term);
       })
       .sort((a, b) => {
@@ -71,12 +72,13 @@ export default function PatientsPage() {
         eyebrow="Records"
         title="Patients"
         subtitle="Everyone who has spoken with Voxera or been referred to this hospital. Active emergencies are pinned to the top."
+        actions={<Link href="/dashboard/patients/search" className="btn"><Icon name="search" size={16} /> Search all hospitals</Link>}
       />
 
       <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
         <div className="relative w-full md:max-w-sm">
           <span className="text-faint pointer-events-none absolute left-3 top-1/2 -translate-y-1/2"><Icon name="search" size={16} /></span>
-          <input className="input" style={{ paddingLeft: 36 }} placeholder="Filter by name, phone or locality" value={q} onChange={(e) => setQ(e.target.value)} />
+          <input className="input" style={{ paddingLeft: 36 }} placeholder="Filter by name, ID, phone or locality" value={q} onChange={(e) => setQ(e.target.value)} />
         </div>
         <div className="flex flex-wrap gap-2">
           <Chip active={filter === "all"} onClick={() => setFilter("all")}>All ({patients.length})</Chip>
@@ -93,7 +95,7 @@ export default function PatientsPage() {
       ) : (
         <div className="card overflow-x-auto">
           <table className="table">
-            <thead><tr><th>Patient</th><th>Age / gender</th><th>Phone</th><th>Locality</th><th>Last contact</th><th>Flags</th></tr></thead>
+            <thead><tr><th>Patient</th><th>Patient ID</th><th>Age / gender</th><th>Phone</th><th>Locality</th><th>Last contact</th><th>Flags</th></tr></thead>
             <tbody>
               {rows.map((p) => {
                 const emergency = emergencyIds.has(p.id);
@@ -105,6 +107,7 @@ export default function PatientsPage() {
                         <Avatar name={p.full_name} size={34} tone={emergency ? "critical" : undefined} /> {p.full_name}
                       </Link>
                     </td>
+                    <td className="font-mono text-xs">{p.patient_id ?? "—"}</td>
                     <td>{[age !== null && `${age}`, p.gender].filter(Boolean).join(" · ") || "—"}</td>
                     <td>{p.phone ?? "—"}</td>
                     <td className="text-muted">{[p.village_or_locality, p.district].filter(Boolean).join(", ") || "—"}</td>

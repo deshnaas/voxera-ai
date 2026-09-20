@@ -25,6 +25,7 @@ const GROUPS: Array<{ title: string; items: Item[] }> = [
     title: "Patients",
     items: [
       { label: "Patients", href: "/dashboard/patients", icon: "users" },
+      { label: "Find patient", href: "/dashboard/patients/search", icon: "search" },
       { label: "Voxera Calls", href: "/dashboard/calls", icon: "headset", badge: "liveCalls" },
     ],
   },
@@ -50,7 +51,9 @@ export default function Sidebar({ open, onClose }: { open: boolean; onClose: () 
   const { counts, facility, user, role, signOut } = useStaff();
 
   const isActive = (href: string) =>
-    href === "/dashboard" ? pathname === "/dashboard" : pathname.startsWith(href);
+    href === "/dashboard" ? pathname === "/dashboard"
+    : href === "/dashboard/patients" ? pathname.startsWith(href) && !pathname.startsWith("/dashboard/patients/search")
+    : pathname.startsWith(href);
 
   return (
     <>

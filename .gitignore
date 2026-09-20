@@ -39,3 +39,11 @@ models/
 # Generated outputs
 last_patient_audio.wav
 voxera_priya_response.wav
+
+# Patient Intelligence: isolated voice-model venv + downloaded weights (~2 GB) — never commit
+voxera_patientfetch/.venv_voice/
+voxera_patientfetch/.model_cache/
+voxera_patientfetch/.venv_voice_install*.log
+
+# Multilingual voice: locally built int8 Whisper (~250 MB) — never commit; rebuild with voxera_multilang.build_fast_stt
+voxera_multilang/.model_cache/

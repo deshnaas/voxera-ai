@@ -107,3 +107,18 @@ Dashboard pages: Command Center (prioritised "needs action now" queue), Emergenc
 Patients (search + filters), Patient record (edit details, calls & transcripts, prescriptions,
 referrals, appointments), Calls + call detail, Referral triage queue.
 Voxera OTC guidance, patient-reported medicines and clinician prescriptions are always shown separately.
+
+## Patient Intelligence (voxera_patientfetch/)
+
+Patient-ID verification on calls, record Q&A, prescription OCR with clinician verification, cross-hospital search with
+audit, adaptive triage and a voice-signal hint. Setup, run commands, API list and safety rules are in
+[`voxera_patientfetch/README.md`](voxera_patientfetch/README.md). Run **`sql/2026_voxera_patient_intelligence.sql`**
+once (it includes everything from `2026_dashboard_v2.sql`). The call layer switches itself off, and says so at boot,
+until that migration has been run.
+
+
+## Multilingual voice (voxera_multilang/)
+
+Hindi / Marathi / English: language detection, speech recognition, reviewed replies and emergency handling for
+Hindi and Marathi. See [`voxera_multilang/README.md`](voxera_multilang/README.md) for setup, how it works and the
+review items to complete before real patient use.
