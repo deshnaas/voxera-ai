@@ -372,7 +372,7 @@ class ScriptedML(MultiLang):
         self.enabled = True
         self.turns = list(turns)
 
-    def transcribe_turn(self, audio, english_fn):
+    def transcribe_turn(self, audio, english_fn, need_translation=True):
         native, english = self.turns.pop(0)
         v = detect_from_text(native, prior=self.tracker.lang, preferred=self.tracker.preferred)
         heard = v.lang or "en"
@@ -412,7 +412,7 @@ class Harness:
         self.call.writer, self.call.call_id = None, None
         self.call.patient, self.call.patient_id = {"id": "placeholder", "full_name": "Placeholder"}, "placeholder"
         self.repo = make_repo()
-        self.call.pf = CallAssistant(db=None, caller_phone=caller_phone, repo=self.repo)
+        self.call.pf = CallAssistant(db=None, caller_phone=caller_phone, repo=self.repo, ask_first=True)
         self.call.pf.rebind_call = lambda call_id: self.call.pf.patient["id"] if self.call.pf.patient else None
         self.call.ml = ScriptedML(turns)
         self.mic = FakeMic()
@@ -503,7 +503,7 @@ def test_verification_failures_and_privacy_notices_are_localised():
     h = Harness([("वी एक्स नौ नौ नौ", "VX 999"), ("मला तुमचा रेकॉर्ड सांगा", "What medicine do I use for my nebulizer?")])
     out = h.run(1)
     assert out[0] == ("hi", cat.PH["retry_id"]["hi"])                                  # 'नौ' (nine) is a Hindi number word
-    h.call.pf.awaiting_id = False                                                        # the caller gave up on the ID
+    h.call.pf.awaiting_id = False; h.call.pf.id_declined = True                          # the caller gave up on the ID
     out = h.run(1)
     assert out[1] == ("mr", cat.PH["no_record_question"]["mr"])                        # and the privacy notice follows the language
 
@@ -584,3 +584,30 @@ if __name__ == "__main__":
     code = 1 if run_all(dict(globals())) else 0
     teardown_module()
     sys.exit(code)
+
+
+# ---------------------------------------------------------------- fever advice in Hindi, and no endless "anything else?"
+def test_hindi_loanword_fever_and_a_fever_question_reach_the_care_topic():
+    import voxera_care as care
+    from voxera_multilang.understand import understand
+    for native, tr in [("मेरे फीवर के लिए मैं क्या कर सकती हूँ", "What can I do for my fever?"),
+                       ("आप आप वी वर अणाँ वी तोट", "I have fever along with it."),
+                       ("मला फीवर आहे", "")]:
+        cg = care.lookup_care(understand(native, tr), [])
+        assert cg is not None and cg.care_id == "mild_fever", (native, tr)
+    assert "I have a fever." not in understand("बुखार नहीं है", "I don't have a fever.")     # a denial is not a symptom
+
+
+def test_generic_replies_end_the_call_instead_of_repeating_anything_else():
+    m = MultiLang(vx)
+    m.set_language("hi")
+    seen = [m.generic_reply("mumble") for _ in range(6)]
+    assert seen[3] == m.say("anything_else") and seen[4] is None and seen[5] is None
+    assert len([s for s in seen if s == m.say("anything_else")]) == 1
+
+
+def test_closing_phrases_in_all_three_languages():
+    from voxera_patientfetch.closing import is_closing
+    assert is_closing("That's all, thank you.") and is_closing("", "धन्यवाद, बस इतना ही") and is_closing("", "धन्यवाद")
+    assert is_closing("No.", "नाही", "क्या मैं आपकी और कुछ मदद कर सकती हूँ?")
+    assert not is_closing("I have a fever.", "मुझे बुखार है")

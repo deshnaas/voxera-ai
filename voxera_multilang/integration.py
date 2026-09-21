@@ -176,7 +176,7 @@ class MultiLang:
             _log(f"reply language -> {NAMES[lang]}")
 
     # ---------------------------------------------------------------- hearing -----------------------
-    def transcribe_turn(self, audio, english_fn: Callable) -> TurnText:
+    def transcribe_turn(self, audio, english_fn: Callable, need_translation: bool = True) -> TurnText:
         """One caller turn -> native text, English text, language. `english_fn(audio)` is the existing base.en STT."""
         t0 = time.time()
         core = self.core
@@ -216,7 +216,7 @@ class MultiLang:
         verdict = detect_from_text(native, prior=self.tracker.lang, preferred=self.tracker.preferred)
         heard = verdict.lang or "hi"
         quick = understand(native, "")
-        if safety.to_english(native) or quick in ("Yes.", "No."):
+        if safety.to_english(native) or quick in ("Yes.", "No.") or not need_translation:
             english = quick or native                                  # an emergency phrase / a plain yes-no: answer NOW
         else:
             english = understand(native, self.stt.translate(a16, "hi"))
@@ -290,7 +290,7 @@ class MultiLang:
     def care_text(self, care, otc, profile: dict) -> Optional[str]:
         return cat.care_reply(care, otc, profile, self.lang)
 
-    def generic_reply(self, english_text: str) -> str:
+    def generic_reply(self, english_text: str) -> Optional[str]:
         """Deterministic conversation for turns no curated path handles (replaces free-form LLM text in hi/mr)."""
         self.generic_turns += 1
         n = self.generic_turns
@@ -300,7 +300,9 @@ class MultiLang:
             return self.say("other_symptoms_q")
         if n == 3:
             return self.say("see_doctor")
-        return self.say("anything_else")
+        if n == 4:
+            return self.say("anything_else")
+        return None                       # nothing new to say: the call is wrapped up instead of repeating itself
 
     def reset_generic(self) -> None:
         self.generic_turns = 0

@@ -43,7 +43,7 @@ NO_RECORD_QUESTION = ("I can't share record details without verifying your patie
                       "I can still help with what you're feeling.")
 
 PHRASES = [
-    ident.ASK_ID, ident.RETRY_ID, ident.RETRY_FORMAT, ident.VERIFIED, ident.GIVE_UP, ident.DB_DOWN,
+    ident.ASK_ID, ident.ASK_ID_FOR_RECORD, ident.ASK_ID_END, ident.SAVED_GOODBYE, ident.GOODBYE, ident.GREETING_NO_ID, ident.RETRY_ID, ident.RETRY_FORMAT, ident.VERIFIED, ident.GIVE_UP, ident.DB_DOWN,
     ident.LOW_ASSURANCE, NUDGE, NO_RECORD_QUESTION, NOT_FOUND, CONFLICT, DB_DOWN,
     TRIAGE_Q["quality"], TRIAGE_Q["redflags_chest"], TRIAGE_Q["ongoing"], TRIAGE_Q["onset"],
     TRIAGE_Q["radiation"], TRIAGE_Q["redflags_which"], TRIAGE_Q["location"], TRIAGE_Q["severity"],
@@ -63,7 +63,7 @@ class IdTurn:
 
 
 class CallAssistant:
-    def __init__(self, db, caller_phone: Optional[str] = None, repo=None):
+    def __init__(self, db, caller_phone: Optional[str] = None, repo=None, ask_first: Optional[bool] = None):
         self.db = db
         self.repo = repo if repo is not None else SupabaseRepo(db.supabase)   # repo= is for tests
         self.svc = PatientIntelligenceAI(self.repo, cache_ttl=1800.0)
@@ -74,6 +74,7 @@ class CallAssistant:
         self.ctx = None
         self.assurance = "none"
         self.awaiting_id = False
+        self.id_declined = False
         self.pending_complaint: Optional[str] = None
         self.nudges = 0
         self.voice_log: list = []
@@ -83,7 +84,10 @@ class CallAssistant:
         self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="pf")
         self._ctx_ready = threading.Event()
         self.enabled = True if repo is not None else self._probe()
-        self.awaiting_id = self.enabled
+        # The ID is asked for only when the caller wants something from their record (medicines, scans,
+        # prescriptions, appointments). VOXERA_ASK_ID_FIRST=1 restores the old "ID before anything" flow.
+        self.ask_first = (os.getenv("VOXERA_ASK_ID_FIRST", "0") == "1") if ask_first is None else ask_first
+        self.awaiting_id = self.enabled and self.ask_first
 
     # ---- boot ---------------------------------------------------------
     def _probe(self) -> bool:
@@ -101,7 +105,7 @@ class CallAssistant:
             return False
 
     def greeting(self) -> str:
-        return ident.ASK_ID
+        return ident.ASK_ID if self.ask_first else ident.GREETING_NO_ID
 
     def warm(self) -> None:
         self.voice.warm()
@@ -134,6 +138,7 @@ class CallAssistant:
             self.nudges += 1
             if self.nudges > 2:
                 self.awaiting_id = False
+                self.id_declined = True
                 return IdTurn(ident.GIVE_UP, finished=True, complaint=self.pending_complaint, reason="declined")
             return IdTurn(NUDGE, reason="nudge")
 
@@ -147,9 +152,11 @@ class CallAssistant:
             return IdTurn(spoken, verified=True, finished=True, complaint=self.pending_complaint, reason="ok")
         if r.reason in ("locked",) or self.verifier.locked:
             self.awaiting_id = False
+            self.id_declined = True
             return IdTurn(ident.GIVE_UP, finished=True, complaint=self.pending_complaint, reason="locked")
         if r.reason == "error":
             self.awaiting_id = False
+            self.id_declined = True
             return IdTurn(ident.DB_DOWN, finished=True, complaint=self.pending_complaint, reason="error")
         return IdTurn(r.spoken, reason=r.reason)
 
@@ -208,6 +215,12 @@ class CallAssistant:
         if info["intent"] == "not_record":
             return None
         if not self.verified:
+            if self.enabled and not self.id_declined and not self.verifier.locked and not self.awaiting_id:
+                # they want something from their record: ask for the ID now, keep the question, answer it once verified
+                self.awaiting_id = True
+                self.nudges = 0
+                self.pending_complaint = text
+                return ident.ASK_ID_FOR_RECORD
             return NO_RECORD_QUESTION
         if not self.can_disclose:
             return ident.LOW_ASSURANCE

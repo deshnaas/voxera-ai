@@ -15,10 +15,10 @@ import re
 
 # (native pattern, plain English statement). Devanagari + romanised.
 SYMPTOMS = [
-    (r"बुखार|ताप\b|तापमान|जर\b|bukhar|taap", "I have a fever."),
+    (r"बुखार|ताप\b|तापमान|जर\b|फीवर|फिवर|टेम्परेचर|bukhar|taap|fever", "I have a fever."),
     (r"हल्का\s*बुखार|सौम्य\s*ताप|थोडा\s*ताप|हलका\s*भुखार|halka\s*bukhar", "I have a mild fever."),
-    (r"खांसी|खाँसी|खोकला|खोकल्या|khansi|khokla", "I have a cough."),
-    (r"सिरदर्द|सिर\s*(?:में\s*)?दर्द|डोकेदुखी|डोके\s*दुख|डोक्यात\s*दुख|sir\s*dard|dokedukhi|डोके\s*दुखि", "I have a headache."),
+    (r"खांसी|खाँसी|खोकला|खोकल्या|कफ\b|कफ़\b|khansi|khokla", "I have a cough."),
+    (r"सिरदर्द|हेडेक|सिर\s*(?:में\s*)?दर्द|डोकेदुखी|डोके\s*दुख|डोक्यात\s*दुख|sir\s*dard|dokedukhi|डोके\s*दुखि", "I have a headache."),
     (r"गले\s*(?:में\s*)?(?:खराश|दर्द|खिचखिच)|घसा\s*(?:दुख|खवखव|खरा)", "I have a sore throat."),
     (r"नाक\s*बंद|बंद\s*नाक|नाक\s*चोंद|नाक\s*वाह|सर्दी|जुकाम|सर्दी-खोकला|नाक\s*गळत", "I have a cold and a blocked nose."),
     (r"पेट\s*(?:में\s*)?दर्द|पोट\s*दुख|पोटात\s*दुख|पेट\s*दुख|pet\s*dard", "My stomach is hurting."),
@@ -36,6 +36,31 @@ SYMPTOMS = [
 YES = re.compile(r"^\W*(?:हाँ|हां|हा|जी\s*हाँ|जी\s*हां|जी|होय|हो|बिल्कुल|बरोबर|सही|yes|haan|ho|hoy)\W*$", re.I)
 NO = re.compile(r"^\W*(?:नहीं|नही|नाही|नको|जी\s*नहीं|नाहीं|बिल्कुल\s*नहीं|no|nahi|nahin)\W*$", re.I)
 NEG_SYMPTOM = re.compile(r"(?:नहीं|नही|नाही|नको)\s*(?:है|हैं|आहे|आहेत)?\s*$")
+
+
+# Whisper's English translation is usually right about the symptom word even when the sentence around it is odd
+# ("What can I do for my fever?"); the English-only care logic wants "I have a fever." so state it plainly.
+_EN_TERMS = [
+    (r"\b(?:fever|feverish)\b", "I have a fever."),
+    (r"\bheadache\b", "I have a headache."),
+    (r"\bcough(?:ing)?\b", "I have a cough."),
+    (r"\bsore throat\b", "I have a sore throat."),
+    (r"\b(?:runny nose|blocked nose|stuffy nose)\b", "I have a cold and a blocked nose."),
+    (r"\b(?:acidity|indigestion)\b", "I have indigestion and acidity."),
+    (r"\bvomit(?:ing)?\b", "I have been vomiting."),
+    (r"\bdiarrh?oea\b|\bdiarrhea\b", "I have diarrhea."),
+    (r"\bdizz(?:y|iness)\b", "I feel dizzy."),
+]
+_EN_NEG = re.compile(r"(?:\bno|\bnot|\bwithout|\bdon'?t have(?: a)?|\bhaven'?t(?: had)?(?: a)?)\s+(?:\w+\s+){0,1}$", re.I)
+
+
+def _stated_en(translation: str) -> list:
+    out: list = []
+    for rx, sentence in _EN_TERMS:
+        m = re.search(rx, translation or "", re.I)
+        if m and not _EN_NEG.search(translation[:m.start()]) and sentence not in out:
+            out.append(sentence)
+    return out
 
 
 def _stated(native: str) -> list:
@@ -63,4 +88,7 @@ def understand(native: str, translation: str) -> str:
     if NO.match(native):
         return "No."
     extra = _stated(native)
+    for s in _stated_en(translation):
+        if s not in extra and not (s == "I have a fever." and "I have a mild fever." in extra):
+            extra.append(s)
     return " ".join([translation, *extra]).strip() if extra else translation

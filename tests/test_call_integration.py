@@ -34,7 +34,7 @@ class FakeMic:
 
 
 class Harness:
-    def __init__(self, script, caller_phone="9990001111", repo=None):
+    def __init__(self, script, caller_phone="9990001111", repo=None, ask_first=True):
         os.environ["VOXERA_VOICE_SIGNAL"] = "0"          # no model worker in these unit tests (restored in teardown)
         self.spoken, self.llm_calls = [], []
         self.script = list(script)
@@ -59,7 +59,7 @@ class Harness:
         self.call.patient = {"id": "placeholder", "full_name": "Placeholder"}
         self.call.patient_id = "placeholder"
         self.repo = repo or make_repo()
-        self.call.pf = CallAssistant(db=None, caller_phone=caller_phone, repo=self.repo)
+        self.call.pf = CallAssistant(db=None, caller_phone=caller_phone, repo=self.repo, ask_first=ask_first)
         self.call.pf.rebind_call = lambda call_id: None if not self.call.pf.patient else self.call.pf.patient["id"]
         self.mic = FakeMic()
 
@@ -198,3 +198,48 @@ if __name__ == "__main__":
     code = 1 if run_all(dict(globals())) else 0
     teardown_module()
     sys.exit(code)
+
+
+# ---------------------------------------------------------------- the ID is asked only when the record is needed
+def test_default_greeting_does_not_ask_for_an_id_and_general_help_needs_none():
+    h = Harness(["My stomach is hurting."], ask_first=False)
+    assert h.call.pf.greeting() == ident.GREETING_NO_ID and not h.call.pf.awaiting_id
+    h.turn()
+    assert not h.call.pf.awaiting_id and not h.call.pf.verified
+    assert ident.ASK_ID_FOR_RECORD not in h.spoken
+
+
+def test_a_record_question_asks_for_the_id_then_answers_that_question():
+    h = Harness(["What medicine do I use for my nebulizer?", "VX 421"], ask_first=False)
+    outs = h.run(2)
+    assert outs[0] == ident.ASK_ID_FOR_RECORD
+    assert h.call.pf.verified and not h.call.pf.awaiting_id
+    assert any("Budecort 0.5 mg" in s for s in h.spoken[1:])
+
+
+def test_declining_the_id_does_not_loop_the_request():
+    h = Harness(["Which scans did the doctor order for me?", "I would rather not say anything about that at all",
+                 "I really don't want to give it to you now", "no no no I will not tell you that thing"], ask_first=False)
+    h.run(4)
+    asked = [s for s in h.spoken if s == ident.ASK_ID_FOR_RECORD]
+    assert len(asked) == 1 and h.call.pf.id_declined and not h.call.pf.verified
+
+
+# ---------------------------------------------------------------- the ID is asked at the END and the call is filed
+def test_goodbye_asks_for_the_id_files_the_call_under_that_patient_and_hangs_up():
+    h = Harness(["My stomach is hurting.", "No, that's all. Thank you.", "VX 421"], ask_first=False)
+    outs = h.run(3)
+    assert outs[1] == ident.ASK_ID_END and h.call.closing
+    assert outs[2] == ident.SAVED_GOODBYE and h.call.finished and h.call.pf.verified
+
+
+def test_declining_the_id_at_the_end_just_says_goodbye():
+    h = Harness(["I have a headache.", "Bye.", "No."], ask_first=False)
+    outs = h.run(3)
+    assert outs[1] == ident.ASK_ID_END and outs[2] == ident.GOODBYE and h.call.finished and not h.call.pf.verified
+
+
+def test_a_verified_caller_is_not_asked_again_at_the_end():
+    h = Harness(["What medicine do I use for my nebulizer?", "VX 421", "That's all, thanks."], ask_first=False)
+    h.run(3)
+    assert ident.ASK_ID_END not in h.spoken and h.spoken[-1] == ident.SAVED_GOODBYE and h.call.finished

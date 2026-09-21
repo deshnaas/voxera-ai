@@ -28,6 +28,8 @@ import time
 import voxera_core as vx
 import voxera_care as care
 import voxera_summary as summary
+from voxera_patientfetch.closing import is_closing, declines_id
+from voxera_patientfetch import identity as _ident
 from voxera_emergency import check_emergency, CANNED_RESPONSES
 
 try:
@@ -133,6 +135,8 @@ class Call:
         # collected for the end-of-call structured summary
         self.emergency_result = None
         self.care_events = []
+        self.closing = False
+        self.finished = False
         self.pf = None                      # CallAssistant when Patient Intelligence is active
         self.ml = None                      # MultiLang when the multilingual voice is active
         self._logged_lang = None
@@ -316,10 +320,43 @@ class Call:
                   "processing what the patient said.")
         return res
 
+    # ---- end of call: file the call under the caller's record ---------------------------------------------
+    def begin_wrapup(self, mic):
+        """The caller is done (or nothing new is left to say). Ask for the patient ID ONCE so this call is added to
+        that patient's record, then say goodbye and hang up."""
+        pf = self.pf
+        self.to(S.PROCESSING)
+        if pf and pf.enabled and not pf.verified and not pf.id_declined and not pf.verifier.locked:
+            self.closing = True
+            pf.awaiting_id = True
+            pf.nudges = 0
+            pf.pending_complaint = None
+            return self.finish_reply(_ident.ASK_ID_END, mic)
+        res = self.finish_reply(_ident.SAVED_GOODBYE if (pf and pf.verified) else _ident.GOODBYE, mic)
+        self.finished = True
+        return res
+
     def handle_id_turn(self, text, mic):
         """Patient-ID phase: verify, then carry on with any complaint already given."""
         self.to(S.PROCESSING)
+        if self.closing and declines_id(text):
+            self.pf.awaiting_id = False
+            self.pf.id_declined = True
+            self.finished = True
+            return self.finish_reply(_ident.GOODBYE, mic)
         out = self.pf.id_turn(text)
+        if self.closing:
+            if out.verified:
+                pid = self.pf.rebind_call(self.call_id)           # the call now belongs to this patient
+                if pid:
+                    self.patient_id = pid
+                    self.patient = self.pf.patient
+                self.finished = True
+                return self.finish_reply(_ident.SAVED_GOODBYE, mic)
+            if out.finished:
+                self.finished = True
+                return self.finish_reply(_ident.GOODBYE, mic)
+            return self.finish_reply(out.text, mic)
         if out.verified:
             pid = self.pf.rebind_call(self.call_id)      # calls.patient_id stays NOT NULL
             if pid:
@@ -421,6 +458,8 @@ class Call:
             # wrong or echoed sentences), so these turns use reviewed, deterministic wording instead.
             self.tracker.mark("ai_start")
             reply = self.ml.generic_reply(patient_text)
+            if reply is None:
+                return self.begin_wrapup(mic)
             self.tracker.mark("ai_first_token")
             self.tracker.mark("ai_end")
         if reply is None:
@@ -466,7 +505,8 @@ class Call:
         turn = None
         if self.ml_on:
             # language ID first; English keeps the existing base.en path, Hindi/Marathi use the multilingual model
-            turn = self.ml.transcribe_turn(audio, lambda a: vx.transcribe(a, tracker=self.tracker))
+            turn = self.ml.transcribe_turn(audio, lambda a: vx.transcribe(a, tracker=self.tracker),
+                                           need_translation=not (self.pf and self.pf.awaiting_id))
             if turn.path == "multilingual":
                 self.tracker.mark("stt_start")
                 self.tracker.mark("stt_end")
@@ -521,7 +561,10 @@ class Call:
             res = {"ok": True, "interrupted": False, "pending_audio": None}
         else:
             print("[SAFETY] no emergency signal")
-            if self.pf and self.pf.awaiting_id:
+            if (not self.closing and not (self.pf and self.pf.awaiting_id)
+                    and is_closing(text_en, text, last_ai)):
+                res = self.begin_wrapup(mic)
+            elif self.pf and self.pf.awaiting_id:
                 res = self.handle_id_turn(id_text, mic)
             else:
                 res = self.handle_normal(text_en, mic)
@@ -549,10 +592,16 @@ def main():
     call = Call()
 
     # -- boot models (once) --------------------------------------
-    vx.load_stt()
+    # load the three slow things at once (speech recognition, the voice, the database) instead of one after another
+    import threading
+    _boot = [threading.Thread(target=vx.load_stt, name="boot-stt"),
+             threading.Thread(target=call.open_supabase_call, name="boot-db")]
+    for t in _boot:
+        t.start()
     vx.load_tts()
+    for t in _boot:
+        t.join()
     vx.prewarm_phrases([GREETING, FALLBACK_REPLY] + CANNED_RESPONSES)
-    call.open_supabase_call()
 
     greeting = GREETING
     if call.pf:
@@ -564,10 +613,10 @@ def main():
         call.ml = MultiLang(vx)
         if call.ml.enabled:
             call.ml.boot()                     # multilingual STT loads in the background; TTS hook installed
-            call.ml.prewarm_greeting(with_id=bool(call.pf))
+            call.ml.prewarm_greeting(with_id=bool(call.pf and call.pf.ask_first))
         if call.ml.enabled:
             # the language is unknown until the caller speaks, so the first line is a short trilingual greeting
-            greeting = call.ml.greeting_text(with_id=bool(call.pf))
+            greeting = call.ml.greeting_text(with_id=bool(call.pf and call.pf.ask_first))
             print("[LANG] multilingual voice ON: English / हिन्दी / मराठी (language is detected from the caller)")
 
     with vx.MicCapture() as mic:
@@ -594,6 +643,9 @@ def main():
                     print("[BARGE] carrying interrupted speech into next turn.")
                 if call.state == S.EMERGENCY:
                     outcome = "emergency_escalated"
+                if call.finished:
+                    print("\n[CALL] wrapped up.")
+                    break
                 print("\n[CALL] your turn ...  (Ctrl+C to hang up)\n")
         except KeyboardInterrupt:
             print("\n[CALL] hangup.")

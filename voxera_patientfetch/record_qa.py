@@ -87,6 +87,9 @@ def classify_intent(q: str) -> dict:
     elif re.search(r"\b(do|did|have|had|am i|was i)\b.*\b(diabet|hypertens|asthma|thyroid|heart|kidney|epilep|blood pressure|sugar)", t) \
             and not re.search(r"\b(prescri|medicin|tablet)\b", t):
         out["intent"] = "condition_check"
+    elif re.search(r"\b(scan|scans|x-?rays?|mri|ultrasound|sonograph\w*|lab reports?|blood tests?|test results?|reports?)\b", t) \
+            and re.search(r"\b(my|mine|did|has|have|was|were|ordered|result|results)\b", t):
+        out["intent"] = "test_reports"                  # scans / reports: needs the record (none stored -> honest not-found)
     elif re.search(r"\b(refer|referred)\b", t):
         out["intent"] = "referral"
     elif re.search(r"\b(next|upcoming|when is my|any)\b.*\bappointment|\bappointment\b", t):

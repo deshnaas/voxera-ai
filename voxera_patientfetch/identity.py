@@ -115,6 +115,11 @@ def phones_match(a: Optional[str], b: Optional[str]) -> Optional[bool]:
 LOW_ASSURANCE = ("For your privacy I can't read out record details on this call, but I can still help "
                  "with what you're feeling. Your care team can go through your records with you.")
 ASK_ID = "Hi, I'm Priya from Voxera. Before we begin, could you please tell me your patient ID?"
+ASK_ID_FOR_RECORD = "To look that up in your record, could you please tell me your patient ID?"
+ASK_ID_END = "Before you go, could you please tell me your patient ID so I can add this call to your record?"
+SAVED_GOODBYE = "Thank you. I've added this call to your record. Take care, and get well soon."
+GOODBYE = "Thank you for calling Voxera. Take care, and get well soon."
+GREETING_NO_ID = "Hi, I'm Priya from Voxera. How can I help you today?"
 RETRY_ID = "Sorry, I couldn't find that patient ID. Could you please repeat it?"
 RETRY_FORMAT = "Sorry, I didn't catch a patient ID there. Could you say it again, one digit at a time?"
 VERIFIED = "Thank you. I have your record. What can I help you with today?"
