@@ -15,7 +15,7 @@ export default function Topbar({
   onToggleTheme: () => void;
   onMenu: () => void;
 }) {
-  const { counts, realtime, lastUpdated, refresh, soundOn, setSoundOn, testSound } = useStaff();
+  const { facility, counts, realtime, lastUpdated, refresh, soundOn, setSoundOn, testSound } = useStaff();
   const [, force] = useState(0);
   useEffect(() => {
     const t = setInterval(() => force((n) => n + 1), 15000);
@@ -42,6 +42,15 @@ export default function Topbar({
       <PatientSearch />
 
       <div className="ml-auto flex items-center gap-2">
+        {facility && facility.verified === false && (
+          <span
+            className="hidden rounded-full px-2.5 py-1 text-xs font-semibold sm:inline-flex"
+            style={{ background: "color-mix(in srgb, #f59e0b 18%, transparent)", color: "#b45309" }}
+            title="A Voxera operator hasn't verified this hospital's registration yet. Everything works normally in the meantime."
+          >
+            Pending verification
+          </span>
+        )}
         {counts.emergencies > 0 && (
           <Link href="/dashboard/emergency" className="btn btn-danger btn-sm">
             <span className="dot dot-critical" style={{ background: "#fff" }} />

@@ -45,6 +45,26 @@ PH = {
         "hi": "वॉक्सेरा को कॉल करने के लिए धन्यवाद। अपना ध्यान रखिए, जल्दी स्वस्थ हो जाइए।",
         "mr": "वॉक्सेराला कॉल केल्याबद्दल धन्यवाद. काळजी घ्या, लवकर बरे व्हा.",
     },
+    "one_moment": {
+        "en": "One moment.",
+        "hi": "एक क्षण।",
+        "mr": "एक क्षण.",
+    },
+    "still_there": {
+        "en": "Hello? Are you still there? I'm happy to help whenever you're ready.",
+        "hi": "हैलो? क्या आप वहाँ हैं? जब आप तैयार हों, मैं मदद के लिए यहीं हूँ।",
+        "mr": "हॅलो? तुम्ही तिथे आहात का? तुम्ही तयार असाल तेव्हा मी मदतीसाठी इथेच आहे.",
+    },
+    "didnt_catch": {
+        "en": "Sorry, I didn't quite catch that. Could you tell me what's bothering you most, like a fever, a cough, pain, or stomach trouble?",
+        "hi": "माफ़ कीजिए, मैं ठीक से समझ नहीं पाई। क्या आप बता सकते हैं कि आपको सबसे ज़्यादा क्या परेशान कर रहा है, जैसे बुखार, खाँसी, दर्द, या पेट की तकलीफ़?",
+        "mr": "माफ करा, मला नीट समजले नाही. तुम्हाला सर्वात जास्त काय त्रास देत आहे ते सांगाल का, जसे ताप, खोकला, दुखणे, किंवा पोटाचा त्रास?",
+    },
+    "say_differently": {
+        "en": "Could you say it a little differently? For example, I have a fever, or my stomach hurts.",
+        "hi": "क्या आप इसे थोड़ा अलग तरह से कह सकते हैं? जैसे, मुझे बुखार है, या मेरे पेट में दर्द है।",
+        "mr": "तुम्ही हे थोडे वेगळ्या पद्धतीने सांगाल का? उदाहरणार्थ, मला ताप आहे, किंवा माझे पोट दुखत आहे.",
+    },
     "retry_id": {
         "en": "Sorry, I couldn't find that patient ID. Could you please repeat it?",
         "hi": "माफ़ कीजिए, मुझे वह पेशेंट आईडी नहीं मिला। क्या आप उसे दोबारा बोल सकते हैं?",
@@ -539,7 +559,7 @@ def emergency_text(spoken_english: str, lang: str) -> str:
     return EMERGENCY["_R_GENERAL"][lang]                 # unknown line: the generic, always-safe one
 
 
-def care_reply(care, otc, profile: dict, lang: str) -> Optional[str]:
+def care_reply(care, otc, profile: dict, lang: str, with_help: bool = True, with_caveat: bool = True) -> Optional[str]:
     """Localized curated guidance for a care topic (first step + OTC line + when to get help), no LLM."""
     block = CARE.get(care.care_id)
     if lang == "en" or not block:
@@ -556,9 +576,10 @@ def care_reply(care, otc, profile: dict, lang: str) -> Optional[str]:
                     parts.append(item["child"][lang])
                 else:
                     parts.append(item["adult"][lang])
-                    if item.get("caveat", {}).get(lang):
+                    if with_caveat and item.get("caveat", {}).get(lang):
                         parts.append(item["caveat"][lang])
                     if profile.get("pregnant"):
                         parts.append(OTC_PREGNANT[lang])
-    parts.append(f"{say('care_help_if', lang)} {block['help'][lang]}।" if lang == "hi" else f"{say('care_help_if', lang)} {block['help'][lang]}.")
+    if with_help:
+        parts.append(f"{say('care_help_if', lang)} {block['help'][lang]}।" if lang == "hi" else f"{say('care_help_if', lang)} {block['help'][lang]}.")
     return " ".join(p.strip() for p in parts if p)

@@ -49,3 +49,4 @@ pglast==8.4
 #   python -m voxera_multilang.build_fast_stt
 faster-whisper==1.2.1
 ctranslate2==4.8.2
+websockets==15.0.1

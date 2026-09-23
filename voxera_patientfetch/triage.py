@@ -215,6 +215,8 @@ def detect_topic(text: str) -> Optional[str]:
 
 
 class TriagePlanner:
+    skip_topics: frozenset = frozenset()
+
     def __init__(self, check_emergency: Callable[..., Any], state: Optional[ConversationClinicalState] = None):
         self.check_emergency = check_emergency
         self.state = state or ConversationClinicalState()
@@ -247,6 +249,8 @@ class TriagePlanner:
         s = self.state
         s.turns += 1
         topic = detect_topic(text)
+        if topic in self.skip_topics:
+            topic = None                                   # this topic is handled by the everyday-symptom flow
 
         if not self._active:
             if not topic or topic in self._done_topics:

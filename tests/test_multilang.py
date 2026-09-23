@@ -476,8 +476,10 @@ def test_hindi_care_guidance_comes_from_the_catalog_and_respects_profile_gates()
     h = Harness([("वी एक्स शून्य शून्य चार दो एक", "VX 421"), ("मुझे हल्का बुखार है", "I have a mild fever")])
     out = h.run(2)
     reply = out[1][1]
+    # first aid + the over-the-counter option come FIRST, then the first follow-up question (the "get help if" line
+    # is kept for the conclusion, after several questions)
     assert out[1][0] == "hi" and cat.CARE["mild_fever"]["step"]["hi"] in reply and "पैरासिटामोल" in reply
-    assert cat.PH["care_help_if"]["hi"] in reply and h.llm_calls == []
+    assert reply.rstrip().endswith("?") and cat.PH["care_help_if"]["hi"] not in reply and h.llm_calls == []
 
 
 def test_generic_hindi_turns_never_call_the_llm_and_never_speak_english():
@@ -611,3 +613,78 @@ def test_closing_phrases_in_all_three_languages():
     assert is_closing("That's all, thank you.") and is_closing("", "धन्यवाद, बस इतना ही") and is_closing("", "धन्यवाद")
     assert is_closing("No.", "नाही", "क्या मैं आपकी और कुछ मदद कर सकती हूँ?")
     assert not is_closing("I have a fever.", "मुझे बुखार है")
+
+
+# =============================================================================== the "hi"-token decode bias
+class TokenAwareSTT:
+    """A closer-to-real fake: decoding with the wrong language token garbles the Marathi-specific words, exactly
+    the bug this section guards against (measured on the real model: Marathi 'aahe' -> Hindi 'hai' under a
+    forced hi token)."""
+    def __init__(self, true_lang, hi_text, mr_text, english="I have a fever"):
+        self.true_lang, self.hi_text, self.mr_text, self.english = true_lang, hi_text, mr_text, english
+        self.calls = []
+
+    def detect(self, a):
+        self.calls.append("detect")
+        return {"hi": 0.5, "mr": 0.5} if self.true_lang != "en" else {"en": 0.9}
+
+    def decode(self, a, lang="hi"):
+        self.calls.append(f"decode:{lang}")
+        return self.hi_text if lang == "hi" else self.mr_text
+
+    def translate(self, a, lang="hi"):
+        self.calls.append(f"translate:{lang}")
+        return self.english
+
+
+def test_marathi_speech_is_still_recognised_when_the_hindi_token_would_garble_it():
+    # decoding Marathi audio with the Hindi token turns "aahe"->"hai" and mangles "kalpasun": a partial, ambiguous
+    # Hindi-ish reading (measured on the real model). The mr-token decode gets the real, unambiguous Marathi words.
+    # detect() alone can't tell (measured near 50/50 on real Marathi audio), so the fix must try the mr token too
+    # and trust whichever decode's own words are actually self-consistent.
+    ml = ScriptedML([])
+    ml.stt = TokenAwareSTT("mr", hi_text="मुझे कालपा सून ताप है", mr_text="मला कालपासून ताप आहे")
+    turn = MultiLang.transcribe_turn(ml, _audio(), lambda a: "junk")
+    assert turn.heard == "mr" and "ताप आहे" in turn.native
+    assert "decode:hi" in ml.stt.calls and "decode:mr" in ml.stt.calls        # both were tried
+
+
+def test_a_clearly_hindi_first_turn_does_not_pay_for_a_second_decode():
+    ml = ScriptedML([])
+    ml.stt = TokenAwareSTT("hi", hi_text="मुझे कल से बुखार है और सिर दर्द हो रहा है", mr_text="should not be used")
+    turn = MultiLang.transcribe_turn(ml, _audio(), lambda a: "junk")
+    assert turn.heard == "hi"
+    assert ml.stt.calls.count("decode:hi") == 1 and "decode:mr" not in ml.stt.calls
+
+
+def test_a_settled_marathi_call_stops_probing_the_hindi_token():
+    ml = ScriptedML([])
+    ml.stt = TokenAwareSTT("mr", hi_text="मुझे कालपा सून ताप है", mr_text="मला कालपासून ताप आहे")
+    for _ in range(ml.PROBE_TURNS):
+        MultiLang.transcribe_turn(ml, _audio(), lambda a: "junk")
+    assert ml.tracker.lang == "mr" and not ml.tracker.tentative
+    ml.stt.calls.clear()
+    turn = MultiLang.transcribe_turn(ml, _audio(), lambda a: "junk")
+    assert turn.heard == "mr" and ml.stt.calls == ["decode:mr", "translate:mr"]     # only the settled token, once
+
+
+def test_translate_also_uses_the_detected_languages_own_token():
+    ml = ScriptedML([])
+    ml.stt = TokenAwareSTT("mr", hi_text="मुझे कालपा सून ताप है", mr_text="मला कालपासून ताप आहे नाही")
+    MultiLang.transcribe_turn(ml, _audio(), lambda a: "junk")
+    assert any(c.startswith("translate:mr") for c in ml.stt.calls)
+
+
+def test_stt_decode_and_translate_pass_through_the_real_language_token():
+    from voxera_multilang.stt import MultiSTT
+    calls = []
+
+    class Probe(MultiSTT):
+        def _run(self, audio, *, language, task):
+            calls.append((language, task))
+            return "x"
+    p = Probe()
+    p.decode(_audio(), "mr")
+    p.decode(_audio(), "hi")
+    p.translate(_audio(), "mr")
+    assert calls == [("mr", "transcribe"), ("hi", "transcribe"), ("mr", "translate")]

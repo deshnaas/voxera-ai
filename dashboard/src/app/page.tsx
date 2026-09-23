@@ -130,6 +130,13 @@ export default function Home() {
             {message}
           </div>
         )}
+
+        <p className="mt-6 text-center text-sm text-gray-600">
+          New hospital?{" "}
+          <a href="/signup" className="font-semibold text-black underline decoration-[#D4AF37] decoration-2 underline-offset-2">
+            Create an account
+          </a>
+        </p>
       </div>
     </main>
   );

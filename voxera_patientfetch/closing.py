@@ -10,11 +10,16 @@ _THANKS = re.compile(r"^\W*(?:ok(?:ay)?[,. ]+)?(?:thanks|thank you)(?: so much| 
 _NATIVE = re.compile(r"धन्यवाद|शुक्रिया|अलविदा|बाय\b|आभार|बस\s*इतना|बस\s*(?:यही|अभी)|बस\.?$|और\s*कुछ\s*नहीं|आणखी\s*काही\s*नाही|"
                      r"इतकेच|एवढेच|येतो\b|झाले\b|काही\s*नाही")
 _ASKED_ELSE = re.compile(r"anything else|else i can|और कुछ मदद|आणखी काही मदत|और कोई|आणखी कोणती", re.I)
+_STRICT = re.compile(r"\b(bye|good ?bye)\b", re.I)
+_STRICT_NATIVE = re.compile(r"अलविदा|बाय\b|येतो\b")
 _PLAIN_NO = re.compile(r"^\W*(?:no|nope|nothing|नहीं|नही|नाही|नको)\W*$", re.I)
 
 
-def is_closing(text_en: str, native: str = "", last_assistant: str = "") -> bool:
+def is_closing(text_en: str, native: str = "", last_assistant: str = "", strict: bool = False) -> bool:
+    """strict=True (a question is waiting for an answer): only an unmistakable goodbye ends the call."""
     en = (text_en or "").strip()
+    if strict:
+        return bool(_STRICT.search(en)) or bool(_STRICT_NATIVE.search(native or ""))
     nat = (native or "").strip()
     if _EN.search(en) and len(en.split()) <= 8:
         return True

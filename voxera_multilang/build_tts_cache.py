@@ -29,6 +29,7 @@ def main() -> int:
     jobs = []
     for lang in ("hi", "mr"):
         jobs += [(t, lang) for t in ml.fixed_phrases(lang)]
+    jobs += [(t, "en") for t in ml.fixed_phrases_en()]
     jobs += [(t, l) for l, t in cat.GREETING_PARTS]
     jobs += [("नमस्ते, मैं वॉक्सेरा हूँ, मैं आपकी क्या मदद कर सकती हूँ?", "hi"),
              ("नमस्कार, मी वॉक्सेरा आहे, मी तुम्हाला कशी मदत करू?", "mr"),

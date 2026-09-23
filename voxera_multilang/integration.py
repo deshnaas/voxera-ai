@@ -80,6 +80,14 @@ class MultiLang:
         self._warmed: set = set()
         self._boot_thread: Optional[threading.Thread] = None
         self.generic_turns = 0
+        self._dev_turns = 0            # counts Hindi/Marathi turns this call, to keep probing both languages early on
+
+    def new_call(self, preferred: Optional[str] = None) -> None:
+        """Forget the previous caller (language, generic-reply count) but keep the loaded models (server use)."""
+        self.tracker = LanguageTracker(preferred=preferred)
+        self.generic_turns = 0
+        self._dev_turns = 0
+        self._apply("en")
 
     # ---------------------------------------------------------------- boot ----------------------
     def boot(self) -> None:
@@ -131,12 +139,84 @@ class MultiLang:
             _log(f"trilingual greeting unavailable ({type(e).__name__}); using English")
             self.enabled = False
 
+    def followup_sentences(self, lang: str) -> list:
+        """Every sentence the everyday-symptom conversation can speak with the standard (adult) profile. Long replies are
+        spoken sentence by sentence on the phone, so caching sentences makes them start instantly."""
+        import voxera_care as care
+        import voxera_followup as fu
+        from voxera_telephony.audio import split_sentences
+        texts = list(fu.fixed_texts(lang))
+        profile = care.build_profile({})
+        for cid, cg in care._CARE.items():
+            otc = care.suggest_otc(cid, profile)
+            if lang == "en":
+                texts.append(" ".join(list(cg.steps[:2]) + ([otc.spoken] if otc and otc.spoken else [])))
+                texts.append(" ".join(list(cg.steps[:1]) + ([care._first_sentence(otc.spoken)] if otc and otc.spoken else [])))
+                if cg.see_help_if:
+                    texts.append(f"{fu.T['help_if']['en']} {cg.see_help_if[0]}")
+            else:
+                for caveat in (True, False):
+                    adv = cat.care_reply(cg, otc, profile, lang, with_help=False, with_caveat=caveat)
+                    if adv:
+                        texts.append(adv)
+                help_if = (cat.CARE.get(cid) or {}).get("help", {}).get(lang)
+                if help_if:
+                    texts.append(f"{fu.T['help_if'][lang]} {help_if}")
+        for key in ("didnt_catch", "say_differently", "one_moment", "still_there"):
+            texts.append(cat.say(key, lang))
+        out, seen = [], set()
+        for t in texts:
+            for sent in split_sentences(t):
+                if sent not in seen:
+                    seen.add(sent)
+                    out.append(sent)
+        return out
+
+    def fixed_phrases_en(self) -> list:
+        """Every fixed ENGLISH line (the LLM only writes free conversation): triage questions - alone and with the
+        calm / understanding lead-ins - triage conclusions, ID and wrap-up lines, emergency replies, record notices."""
+        from voxera_patientfetch import triage as tri
+        from voxera_patientfetch.call_integration import PHRASES as PF_LINES
+        from voxera_emergency import CANNED_RESPONSES
+        lead = ["", cat.PH["calm_prefix"]["en"], cat.PH["understand_prefix"]["en"]]
+        out = [p + q for q in tri.Q.values() for p in lead]
+        out += list(tri.TEXT_CONCLUSION.values()) + list(PF_LINES) + list(CANNED_RESPONSES)
+        out += [v["en"] for v in cat.EMERGENCY.values() if "en" in v]
+        out += [v["en"] for v in cat.PH.values() if "en" in v]
+        out += self.followup_sentences("en")
+        seen, res = set(), []
+        for t in out:
+            if isinstance(t, str) and t.strip() and t not in seen:
+                seen.add(t)
+                res.append(t)
+        return res
+
+    def load_english_cache(self) -> int:
+        n = 0
+        for text in self.fixed_phrases_en():
+            a = self.tts.load_cached(text, "en")
+            if a is not None:
+                self.core._tts_cache[self.core._tts_key(text, "en")] = a
+                n += 1
+        return n
+
     def fixed_phrases(self, lang: str) -> list:
         """Every fixed line Voxera can speak in `lang` (rendered once by build_tts_cache.py)."""
         out = [v[lang] for v in cat.EMERGENCY.values()]
         out += [v[lang] for k, v in cat.PH.items() if k not in ("ask_id",)]
         out += [v[lang] for v in cat.TRIAGE_Q.values()]
         out += [v[lang] for v in cat.TRIAGE_CONCLUSION.values()]
+        try:                                    # the standard (adult, no allergies) guidance for every care topic
+            import voxera_care as care
+            profile = care.build_profile({})
+            for cid in cat.CARE:
+                shim = type("C", (), {"care_id": cid})
+                t = cat.care_reply(shim, care.suggest_otc(cid, profile), profile, lang)
+                if t:
+                    out.append(t)
+        except Exception:                                            # noqa: BLE001
+            pass
+        out += self.followup_sentences(lang)
         out += [cat.HEDGE_L[lang], cat.OLD_RX_L[lang], cat.NOT_FOUND_L[lang], cat.CONFLICT_L[lang], cat.DB_DOWN_L[lang]]
         return out
 
@@ -211,19 +291,40 @@ class MultiLang:
                 self._apply(self.tracker.current("en"))
                 return TurnText(text, text, self.lang, "en", fam_conf, "english", probs, int((time.time() - t0) * 1000))
 
-        # Hindi / Marathi. Decode FIRST with every core; translate only if the words alone are not enough.
-        native = self.stt.decode(a16, "hi")
-        verdict = detect_from_text(native, prior=self.tracker.lang, preferred=self.tracker.preferred)
-        heard = verdict.lang or "hi"
+        # Hindi / Marathi. Decode with the language's OWN token (a "hi" token biases the words themselves toward
+        # Hindi spellings - see stt.py); when unsure which it is, decode with both and keep the one whose own words
+        # agree with it. A settled call (several confident turns of the same language) skips the second decode.
+        native, verdict = self._decode_dev(a16)
+        heard = verdict.lang or self.tracker.lang or "hi"
         quick = understand(native, "")
         if safety.to_english(native) or quick in ("Yes.", "No.") or not need_translation:
             english = quick or native                                  # an emergency phrase / a plain yes-no: answer NOW
         else:
-            english = understand(native, self.stt.translate(a16, "hi"))
+            english = understand(native, self.stt.translate(a16, heard))
         self.tracker.observe(heard, verdict.confidence, len(native.split()))
+        self._dev_turns += 1
         self._apply(self.tracker.current("en"))
         _log(f"heard {NAMES[heard]} (words hi={verdict.hi_score} mr={verdict.mr_score}) -> replying in {NAMES[self.lang]}")
         return TurnText(native, english, self.lang, heard, verdict.confidence, "multilingual", probs, int((time.time() - t0) * 1000))
+
+    PROBE_TURNS = 3   # keep checking both languages for this many Hindi/Marathi turns, even after one looks decided
+
+    def _decode_dev(self, a16):
+        settled = (self.tracker.lang in ("hi", "mr") and not self.tracker.tentative
+                   and self._dev_turns >= self.PROBE_TURNS)
+        if settled:
+            tok = self.tracker.lang
+            native = self.stt.decode(a16, tok)
+            return native, detect_from_text(native, prior=self.tracker.lang, preferred=self.tracker.preferred)
+        hi_native = self.stt.decode(a16, "hi")
+        hi_verdict = detect_from_text(hi_native, prior=self.tracker.lang, preferred=self.tracker.preferred)
+        if hi_verdict.lang == "hi" and hi_verdict.confidence >= 0.75 and hi_verdict.hi_score >= 2:
+            return hi_native, hi_verdict                                # clearly Hindi even by its own (Hindi-token) words
+        mr_native = self.stt.decode(a16, "mr")
+        mr_verdict = detect_from_text(mr_native, prior=self.tracker.lang, preferred=self.tracker.preferred)
+        if mr_verdict.lang == "mr" and mr_verdict.confidence >= hi_verdict.confidence:
+            return mr_native, mr_verdict
+        return hi_native, hi_verdict
 
     def maybe_switch_on_request(self, turn: TurnText) -> Optional[str]:
         """'Please speak in Marathi' style requests win over detection."""

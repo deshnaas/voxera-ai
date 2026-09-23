@@ -24,6 +24,7 @@ export type Facility = {
   type: string | null;
   location: string | null;
   district: string | null;
+  verified: boolean | null;
 };
 
 export type Counts = {
@@ -158,10 +159,15 @@ export function StaffProvider({ children }: { children: React.ReactNode }) {
         .from("hospital_users")
         .select("facility_id, role")
         .eq("user_id", u.id)
-        .single();
+        .maybeSingle();
       if (cancelled) return;
+      if (!huErr && !hu) {
+        // signed in, but no hospital yet — send them to finish setting one up instead of a dead end
+        router.replace("/onboarding");
+        return;
+      }
       if (huErr || !hu) {
-        setError("This login is not linked to a hospital. Ask an administrator to add you to hospital_users.");
+        setError("Couldn't load your hospital account. Please try signing in again.");
         setLoading(false);
         return;
       }
@@ -170,7 +176,7 @@ export function StaffProvider({ children }: { children: React.ReactNode }) {
 
       const { data: f } = await supabase
         .from("facilities")
-        .select("id, name, type, location, district")
+        .select("id, name, type, location, district, verified")
         .eq("id", hu.facility_id)
         .single();
       if (cancelled) return;

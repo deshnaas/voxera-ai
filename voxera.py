@@ -28,6 +28,12 @@ import time
 import voxera_core as vx
 import voxera_care as care
 import voxera_summary as summary
+from voxera_followup import FollowUp
+try:
+    from voxera_telephony.errors import CallEnded
+except Exception:                                    # noqa: BLE001  (telephony is optional)
+    class CallEnded(Exception):
+        """The caller hung up / the line dropped."""
 from voxera_patientfetch.closing import is_closing, declines_id
 from voxera_patientfetch import identity as _ident
 from voxera_emergency import check_emergency, CANNED_RESPONSES
@@ -134,9 +140,14 @@ class Call:
         self.t_start = time.time()
         # collected for the end-of-call structured summary
         self.emergency_result = None
+        self.speaker = None        # audio-out override (telephony); None = local speakers
         self.care_events = []
         self.closing = False
         self.finished = False
+        self.fu = FollowUp()                                   # everyday symptoms: help first, ask, then conclude
+        self.followup_on = os.getenv("VOXERA_FOLLOWUP", "1") != "0"
+        self.curated_only = os.getenv("VOXERA_CURATED", "0") == "1"   # phone: never use the free-form LLM
+        self.unknown_n = 0
         self.pf = None                      # CallAssistant when Patient Intelligence is active
         self.ml = None                      # MultiLang when the multilingual voice is active
         self._logged_lang = None
@@ -147,13 +158,13 @@ class Call:
         self.state = new
 
     # -- supabase bootstrap ----------------------------------------
-    def open_supabase_call(self):
+    def open_supabase_call(self, phone=None, name=None):
         if not DB_OK:
             print("[DB] disabled — using in-memory conversation only.")
             return
         try:
-            phone = os.getenv("VOXERA_DEMO_PHONE", "9990001111").strip()
-            name = os.getenv("VOXERA_DEMO_PATIENT_NAME", "Voxera Demo Patient").strip()
+            phone = (phone or os.getenv("VOXERA_DEMO_PHONE", "9990001111")).strip()
+            name = (name or os.getenv("VOXERA_DEMO_PATIENT_NAME", "Voxera Demo Patient")).strip()
             lang = os.getenv("VOXERA_DEMO_LANGUAGE", "English").strip() or "English"
             self.patient = db.get_or_create_patient(name, phone, lang)
             self.patient_id = self.patient["id"]
@@ -176,6 +187,8 @@ class Call:
                 try:
                     pf = CallAssistant(db, caller_phone=phone)
                     self.pf = pf if pf.enabled else None
+                    if self.pf and self.followup_on:
+                        self.pf.triage.skip_topics = frozenset({"head"})
                     if self.pf:
                         print("[PATIENT_AI] patient-ID verification is ON for this call.")
                 except Exception as e:
@@ -184,6 +197,10 @@ class Call:
         except Exception as e:
             print(f"[DB] could not open call ({e}); continuing without persistence.")
             self.call_id = None
+
+    def speak(self, text, tracker=None, allow_barge_in=False, mic=None):
+        """Speak on this call's audio channel (local speakers by default; a phone line installs its own)."""
+        return (self.speaker or vx.speak)(text, tracker=tracker, allow_barge_in=allow_barge_in, mic=mic)
 
     def persist_turn(self, speaker, message):
         if self.writer and self.call_id and message:
@@ -263,7 +280,7 @@ class Call:
         self.mem.add_assistant(result.spoken_response)
         self.persist_turn("ai", result.spoken_response)
         print(f"\nVOXERA: {result.spoken_response}\n")
-        vx.speak(result.spoken_response, tracker=self.tracker, mic=mic)
+        self.speak(result.spoken_response, tracker=self.tracker, mic=mic)
 
         # 2. escalate + persist (async, never blocks the call)
         if self.writer and self.call_id:
@@ -313,7 +330,7 @@ class Call:
         self.ai_response_count += 1
         print(f"\nVOXERA: {reply}\n")
         self.to(S.SPEAKING)
-        res = vx.speak(reply, tracker=self.tracker, allow_barge_in=True, mic=mic)
+        res = self.speak(reply, tracker=self.tracker, allow_barge_in=True, mic=mic)
         if res.get("interrupted"):
             self.interruption_count += 1
             print(f"[BARGE] interruption #{self.interruption_count} — "
@@ -399,6 +416,64 @@ class Call:
             return self.finish_reply(self.ml.triage_text(step) if self.ml_on else step.text, mic)
         return None
 
+    # ---- everyday symptoms: help first, then a few questions, then a conclusion ---------------------------
+    def _care_bits(self, cid):
+        """(advice, help_if) for a care topic, in the caller's language, safety-gated by the patient's profile."""
+        cg = care._CARE[cid]
+        profile = care.build_profile(self.mem.facts)
+        otc = care.suggest_otc(cid, profile)
+        lang = self.lang
+        if lang != "en" and self.ml_on:
+            from voxera_multilang import catalog as _cat
+            adv = _cat.care_reply(cg, otc, profile, lang, with_help=False, with_caveat=False)
+            help_if = (_cat.CARE.get(cid) or {}).get("help", {}).get(lang, "")
+        else:
+            adv = " ".join(list(cg.steps[:1]) + ([care._first_sentence(otc.spoken)] if otc and otc.spoken else []))
+            help_if = cg.see_help_if[0] if cg.see_help_if else ""
+        return cg, otc, profile, adv, help_if
+
+    def _start_topic(self, cid, text, others, mic):
+        cg, otc, profile, adv, help_if = self._care_bits(cid)
+        print(f"[CARE] topic={cid}" + (f"  otc={otc.items or 'deferred'}" if otc else "  otc=none"))
+        step = self.fu.start(cid, adv, text, self.lang, others=others)
+        self.mem.facts.setdefault("_care_given", []).append(cid)
+        self.care_events.append({"topic": cid, "label": cg.label, "steps": list(cg.steps), "escalation": list(cg.see_help_if),
+                                 "otc": ({"deferred": otc.deferred, "items": list(otc.items), "spoken": otc.spoken} if otc else None)})
+        self.unknown_n = 0
+        return self.finish_reply(step.text, mic)
+
+    def handle_followup(self, patient_text, mic):
+        fu = self.fu
+        if fu.active:
+            cid = fu.state.care_id if fu.state else None
+            help_if = self._care_bits(cid)[4] if cid else ""
+            step = fu.process(patient_text, self.lang, help_if)
+            if step.kind == "start_next":
+                return self._start_topic(step.care_id, patient_text, [], mic)
+            if step.kind == "passthrough":
+                return None
+            if step.kind == "conclude":
+                print(f"[CARE] follow-up conclusion: {step.care_id} -> {step.level}")
+                self.mem.facts.setdefault("_followup", []).append({"topic": step.care_id, "level": step.level})
+            return self.finish_reply(step.text, mic)
+        topics = fu.new_topics(patient_text)
+        if not topics:
+            return None
+        return self._start_topic(topics[0], patient_text, topics[1:], mic)
+
+    def unknown_reply(self, mic):
+        """A turn nothing curated understood. No free-form LLM (it invents things): ask again kindly, then wrap up."""
+        from voxera_multilang import catalog as _cat
+        self.unknown_n += 1
+        lang = self.lang
+        if self.unknown_n == 1:
+            text = _cat.say("didnt_catch", lang)
+        elif self.unknown_n == 2:
+            text = _cat.say("say_differently", lang)
+        else:
+            return self.begin_wrapup(mic)
+        return self.finish_reply(text, mic)
+
     def handle_normal(self, patient_text, mic):
         self.to(S.PROCESSING)
 
@@ -411,6 +486,11 @@ class Call:
         fl = vx.facts_line(self.mem.facts)
         if fl:
             print(f"[FACTS] {fl}")
+
+        if self.followup_on:
+            r = self.handle_followup(patient_text, mic)
+            if r is not None:
+                return r
 
         # --------------------------------------------------------
         # CONTROLLED HOME-CARE / OTC LAYER
@@ -453,6 +533,8 @@ class Call:
         # --------------------------------------------------------
         # NORMAL CONVERSATIONAL PATH (unchanged)
         # --------------------------------------------------------
+        if reply is None and self.curated_only:
+            return self.unknown_reply(mic)
         if reply is None and self.ml_on and self.lang != "en":
             # The local LLM cannot be trusted to write Hindi/Marathi for a medical assistant (it produces
             # wrong or echoed sentences), so these turns use reviewed, deterministic wording instead.
@@ -486,12 +568,59 @@ class Call:
 
         print(f"\nVOXERA: {reply}\n")
         self.to(S.SPEAKING)
-        res = vx.speak(reply, tracker=self.tracker, allow_barge_in=True, mic=mic)
+        res = self.speak(reply, tracker=self.tracker, allow_barge_in=True, mic=mic)
         if res.get("interrupted"):
             self.interruption_count += 1
             print(f"[BARGE] interruption #{self.interruption_count} — "
                   "processing what the patient said.")
         return res
+
+    # ---- one whole call: greeting -> turns -> wrap-up. Same code for the local mic and for a phone line ----------
+    def serve(self, mic, greeting, greeting_barge=False):
+        self.to(S.GREETING)
+        self.mem.add_assistant(greeting)
+        self.persist_turn("ai", greeting)
+        print(f"\nVOXERA: {greeting}\n")
+        outcome = "completed"
+        primed = None
+        try:
+            g = self.speak(greeting, tracker=self.tracker, allow_barge_in=greeting_barge, mic=mic)
+            if g and g.get("interrupted") and g.get("pending_audio"):
+                primed = g["pending_audio"]              # they started talking over the greeting: don't lose it
+            while True:
+                res = self.run_turn(mic, primed=primed)
+                primed = None
+                if res and res.get("interrupted") and res.get("pending_audio"):
+                    # keep the first words of the interruption
+                    primed = res["pending_audio"]
+                    print("[BARGE] carrying interrupted speech into next turn.")
+                if self.state == S.EMERGENCY:
+                    outcome = "emergency_escalated"
+                if self.finished:
+                    print("\n[CALL] wrapped up.")
+                    break
+                print("\n[CALL] your turn ...  (Ctrl+C to hang up)\n")
+        except (KeyboardInterrupt, CallEnded) as e:
+            print("\n[CALL] hangup." if isinstance(e, KeyboardInterrupt) else f"\n[CALL] caller hung up ({e}).")
+        except Exception as e:
+            print(f"\n[CALL] error: {e!r}")
+            outcome = "failed"
+        finally:
+            self.to(S.ENDING)
+            # persist the compact structured facts as a system turn
+            fl = vx.facts_line(self.mem.facts)
+            if fl:
+                print(f"[FACTS] final: {fl}")
+                self.persist_turn("system", f"structured_facts: {fl}")
+            if self.writer:
+                self.writer.drain(timeout=8.0)   # let referral/turn writes land
+            self.close_supabase_call(outcome)
+            self.write_call_summary(outcome)
+            if self.pf:
+                self.pf.close()
+            print(self.tracker.summary())
+            print("\n[CALL] ended.\n")
+        return outcome
 
     def run_turn(self, mic, primed=None):
         self.tracker.start_turn()
@@ -562,7 +691,7 @@ class Call:
         else:
             print("[SAFETY] no emergency signal")
             if (not self.closing and not (self.pf and self.pf.awaiting_id)
-                    and is_closing(text_en, text, last_ai)):
+                    and is_closing(text_en, text, last_ai, strict=bool(self.fu.state and self.fu.state.pending))):
                 res = self.begin_wrapup(mic)
             elif self.pf and self.pf.awaiting_id:
                 res = self.handle_id_turn(id_text, mic)
@@ -623,50 +752,7 @@ def main():
         mic.calibrate()
         if call.pf:
             call.pf.warm()                     # emotion model loads in its own low-priority process
-
-        # -- greeting ------------------------------------------
-        call.to(S.GREETING)
-        call.mem.add_assistant(greeting)
-        call.persist_turn("ai", greeting)
-        print(f"\nVOXERA: {greeting}\n")
-        vx.speak(greeting, tracker=call.tracker, mic=mic)
-
-        primed = None
-        outcome = "completed"
-        try:
-            while True:
-                res = call.run_turn(mic, primed=primed)
-                primed = None
-                if res and res.get("interrupted") and res.get("pending_audio"):
-                    # keep the first words of the interruption
-                    primed = res["pending_audio"]
-                    print("[BARGE] carrying interrupted speech into next turn.")
-                if call.state == S.EMERGENCY:
-                    outcome = "emergency_escalated"
-                if call.finished:
-                    print("\n[CALL] wrapped up.")
-                    break
-                print("\n[CALL] your turn ...  (Ctrl+C to hang up)\n")
-        except KeyboardInterrupt:
-            print("\n[CALL] hangup.")
-        except Exception as e:
-            print(f"\n[CALL] error: {e!r}")
-            outcome = "failed"
-        finally:
-            call.to(S.ENDING)
-            # persist the compact structured facts as a system turn
-            fl = vx.facts_line(call.mem.facts)
-            if fl:
-                print(f"[FACTS] final: {fl}")
-                call.persist_turn("system", f"structured_facts: {fl}")
-            if call.writer:
-                call.writer.drain(timeout=8.0)   # let referral/turn writes land
-            call.close_supabase_call(outcome)
-            call.write_call_summary(outcome)
-            if call.pf:
-                call.pf.close()
-            print(call.tracker.summary())
-            print("\n[CALL] ended.\n")
+        call.serve(mic, greeting)
 
 
 if __name__ == "__main__":

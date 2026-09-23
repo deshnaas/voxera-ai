@@ -74,9 +74,11 @@ class MultiSTT:
         return re.sub(r"\s+", " ", text)
 
     def decode(self, audio, lang: str = "hi") -> str:
-        """Hindi and Marathi share a decoding language token: the model's Hindi/Marathi words follow the audio
-        (verified: Marathi audio decodes to Marathi words either way), and the words decide which it was."""
-        return self._run(audio, language="en" if lang == "en" else "hi", task="transcribe")
+        """Decode with the GIVEN language's own token. Forcing the Hindi token on Marathi speech biases the
+        decoder's word choices toward Hindi spellings (measured: Marathi "aahe" comes out as Hindi "hai") -
+        exactly what then fools word-based Hindi/Marathi detection. Pass the caller's actual (or candidate)
+        language; integration.py tries both when it isn't sure yet."""
+        return self._run(audio, language=lang if lang in ("en", "hi", "mr") else "hi", task="transcribe")
 
     def translate(self, audio, lang: str = "hi") -> str:
-        return self._run(audio, language="hi" if lang != "en" else "en", task="translate")
+        return self._run(audio, language=lang if lang in ("en", "hi", "mr") else "hi", task="translate")
